@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-idb"
+version = "0.1.0"
+description = "Autonomous bulk AI reverse engineering and IDB enrichment workbench for IDA Pro"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.gui-scripts]
+omni-idb = "omni_idb.app:run"
+
+[tool.setuptools]
+packages = ["omni_idb"]

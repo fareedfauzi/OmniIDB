@@ -1,0 +1,12 @@
+# OmniIDB Dependencies
+# Core engine & GUI run out-of-the-box on standard Python 3.9+ with Tkinter.
+# The packages below enable enhanced capabilities:
+
+# High-fidelity image scaling and icon anti-aliasing
+Pillow>=10.0.0
+
+# Publication-grade vector PDF malware analysis reports (optional; built-in generator used if absent)
+reportlab>=4.0.0
+
+# OpenAI API and ChatGPT Account Responses API integration
+openai>=1.0.0

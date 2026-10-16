@@ -1,0 +1,321 @@
+"""Content-based sample discovery and validation."""
+
+from __future__ import annotations
+
+import enum
+import os
+import struct
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+MAX_PROBE = 1024 * 1024
+MAX_SHELLCODE_SIZE = 256 * 1024 * 1024
+
+
+class SampleKind(enum.Enum):
+    EXECUTABLE = ("Executable", "executable")
+    IDA_DATABASE = ("IDA database", "ida_database")
+    SHELLCODE = ("Raw shellcode", "shellcode")
+
+    @property
+    def label(self) -> str:
+        return self.value[0]
+
+    @property
+    def job_value(self) -> str:
+        return self.value[1]
+
+
+@dataclass
+class Sample:
+    path: Path
+    size: int
+    kind: SampleKind
+    status: str = "Ready"
+    stage: str = "-"
+    start_time: Optional[float] = None
+    elapsed_seconds: Optional[float] = None
+    added_time: str = field(default_factory=lambda: time.strftime("%H:%M:%S"))
+
+    def is_pending(self) -> bool:
+        return self.status in ("Ready", "Queued", "Pending", "")
+
+    def is_running(self) -> bool:
+        return self.status in ("Opening in IDA", "Running in IDA") or self.status.startswith(
+            ("Renaming", "Analyzing", "Processing", "Running")
+        )
+
+    def is_complete(self) -> bool:
+        return self.status == "Complete"
+
+    def is_failed(self) -> bool:
+        return self.status == "Failed"
+
+    def time_spent(self) -> str:
+        if self.elapsed_seconds is not None:
+            secs = max(0, int(self.elapsed_seconds))
+            mins = secs // 60
+            rem = secs % 60
+            if mins > 0:
+                return f"{mins}m {rem:02d}s"
+            return f"{rem}s"
+        if self.start_time is not None and self.is_running():
+            secs = max(0, int(time.time() - self.start_time))
+            mins = secs // 60
+            rem = secs % 60
+            return f"{mins:02d}:{rem:02d}"
+        return "--"
+
+
+@dataclass
+class RejectedFile:
+    path: Path
+    reason: str
+
+
+@dataclass
+class DiscoveryReport:
+    samples: list[Sample] = field(default_factory=list)
+    rejected: list[RejectedFile] = field(default_factory=list)
+
+
+class ClassifyError(Exception):
+    """Raised with a human-readable rejection reason."""
+
+
+_NON_SAMPLE_SIGNATURES = [
+    (b"\xff\xd8\xff", "JPEG image"),
+    (b"\x89PNG\r\n\x1a\n", "PNG image"),
+    (b"GIF87a", "GIF image"),
+    (b"GIF89a", "GIF image"),
+    (b"BM", "BMP image"),
+    (b"%PDF-", "PDF document"),
+    (b"PK\x03\x04", "ZIP/archive or Office document"),
+    (b"PK\x05\x06", "ZIP archive"),
+    (b"Rar!\x1a\x07", "RAR archive"),
+    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+    (b"\x1f\x8b", "gzip archive"),
+    (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "OLE/Office document"),
+    (b"SQLite format 3\x00", "SQLite database"),
+    (b"RIFF", "RIFF media file"),
+]
+
+
+def _known_non_sample(data: bytes) -> Optional[str]:
+    for signature, label in _NON_SAMPLE_SIGNATURES:
+        if data.startswith(signature):
+            return label
+    return None
+
+
+def _valid_pe(data: bytes, file_size: int) -> bool:
+    if len(data) < 0x40 or not data.startswith(b"MZ"):
+        return False
+    offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if offset < 0x40 or offset + 24 > len(data):
+        return False
+    if data[offset : offset + 4] != b"PE\0\0":
+        return False
+    machine, sections = struct.unpack_from("<HH", data, offset + 4)
+    optional_size = struct.unpack_from("<H", data, offset + 20)[0]
+    if (
+        machine not in (0x014C, 0x01C0, 0x01C2, 0x01C4, 0x0200, 0x8664, 0xAA64)
+        or sections == 0
+        or sections > 96
+        or optional_size < 2
+    ):
+        return False
+    optional = offset + 24
+    end = optional + optional_size
+    if end > len(data) or end > file_size:
+        return False
+    return struct.unpack_from("<H", data, optional)[0] in (0x010B, 0x020B)
+
+
+def _valid_elf(data: bytes) -> bool:
+    if len(data) < 52 or not data.startswith(b"\x7fELF"):
+        return False
+    cls, endian = data[4], data[5]
+    if cls not in (1, 2) or endian not in (1, 2) or data[6] != 1:
+        return False
+    fmt = "<H" if endian == 1 else ">H"
+    file_type = struct.unpack_from(fmt, data, 16)[0]
+    machine = struct.unpack_from(fmt, data, 18)[0]
+    return 1 <= file_type <= 4 and machine != 0 and (cls == 1 or len(data) >= 64)
+
+
+_MACHO_MAGICS = {
+    bytes.fromhex(h)
+    for h in (
+        "feedface",
+        "cefaedfe",
+        "feedfacf",
+        "cffaedfe",
+        "cafebabe",
+        "bebafeca",
+        "cafebabf",
+        "bfbafeca",
+    )
+}
+
+
+def _valid_macho(data: bytes) -> bool:
+    return len(data) >= 28 and data[:4] in _MACHO_MAGICS
+
+
+def _looks_like_text(data: bytes) -> bool:
+    sample = data[: 64 * 1024]
+    if not sample:
+        return False
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    printable = sum(1 for b in sample if b in (9, 10, 13) or 0x20 <= b <= 0x7E)
+    return printable * 100 >= len(sample) * 90
+
+
+def _validate_shellcode(data: bytes, size: int) -> None:
+    if size < 2:
+        raise ClassifyError("shellcode is too small")
+    if size > MAX_SHELLCODE_SIZE:
+        raise ClassifyError("raw shellcode exceeds the 256 MiB safety limit")
+    if data.count(data[0]) == len(data):
+        raise ClassifyError("raw file contains only one repeated byte")
+    if _looks_like_text(data):
+        raise ClassifyError("text content is not shellcode")
+
+
+def classify_sample(path: Path | str, allow_shellcode: bool) -> SampleKind:
+    """Return the sample kind, or raise ``ClassifyError`` with the rejection reason."""
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise ClassifyError(f"cannot read metadata: {error}") from error
+    if size == 0:
+        raise ClassifyError("empty file")
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_PROBE)
+    except OSError as error:
+        raise ClassifyError(f"cannot open file: {error}") from error
+
+    label = _known_non_sample(data)
+    if label:
+        raise ClassifyError(f"{label} is not an executable sample")
+    if _valid_pe(data, size) or _valid_elf(data) or _valid_macho(data):
+        return SampleKind.EXECUTABLE
+
+    ext = path.suffix.lstrip(".").lower()
+    if ext in ("py", "pyw", "pyc", "pyo", "pyd"):
+        raise ClassifyError("Python script is not a compiled executable or IDA database")
+    if ext in ("bat", "cmd", "ps1", "sh", "bash", "zsh"):
+        raise ClassifyError("Shell/batch script is not a compiled executable or IDA database")
+    if ext in ("txt", "md", "json", "yml", "yaml", "xml", "csv", "tsv", "log", "ini", "cfg", "toml"):
+        raise ClassifyError("Text/data file is not a compiled executable or IDA database")
+    if ext in ("idb", "i64"):
+        if size < 32 or not data.startswith((b"IDA0", b"IDA1", b"IDA2")):
+            raise ClassifyError("malformed IDA database (invalid IDB signature)")
+        return SampleKind.IDA_DATABASE
+    if ext in ("exe", "dll", "sys", "drv", "ocx", "cpl", "scr", "exe_"):
+        raise ClassifyError("malformed PE file (missing or invalid PE headers)")
+    if ext in ("elf", "so"):
+        raise ClassifyError("malformed ELF file")
+    if ext in ("macho", "dylib"):
+        raise ClassifyError("malformed Mach-O file")
+    if ext in ("bin", "raw", "sc", "shellcode"):
+        if not allow_shellcode:
+            raise ClassifyError("raw shellcode support is disabled")
+        _validate_shellcode(data, size)
+        return SampleKind.SHELLCODE
+    raise ClassifyError("unrecognized or unsupported file format")
+
+
+def _push_classified(path: Path, allow_shellcode: bool, report: DiscoveryReport) -> None:
+    try:
+        kind = classify_sample(path, allow_shellcode)
+    except ClassifyError as error:
+        report.rejected.append(RejectedFile(path, str(error)))
+        return
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    report.samples.append(Sample(path, size, kind))
+
+
+SKIP_DISCOVERY_EXTENSIONS = {
+    ".py", ".pyw", ".pyc", ".pyo",
+    ".bat", ".cmd", ".ps1", ".sh", ".bash", ".zsh",
+    ".txt", ".md", ".json", ".yml", ".yaml", ".xml", ".csv", ".tsv", ".log", ".ini", ".cfg", ".toml",
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".bmp", ".pdf",
+    ".zip", ".tar", ".gz", ".7z", ".rar",
+}
+
+
+def discover(
+    input_path: Path | str,
+    recursive: bool = True,
+    output_root: Path | str | None = None,
+    allow_shellcode: bool = False,
+) -> DiscoveryReport:
+    input_path = Path(input_path)
+    report = DiscoveryReport()
+    if input_path.is_file():
+        _push_classified(input_path, allow_shellcode, report)
+        return report
+    if not input_path.is_dir():
+        raise OSError(f"Input path is not a file or directory: {input_path}")
+
+    output = None
+    if output_root and str(output_root).strip():
+        try:
+            output = Path(output_root).resolve(strict=True)
+        except OSError:
+            output = None
+
+    seen: set[Path] = set()
+    skip_names = {".git", "target", "__pycache__", ".vscode", ".idea", "node_modules", "venv", ".venv"}
+    for current, dirs, files in os.walk(input_path):
+        current_path = Path(current)
+        kept = []
+        for name in dirs:
+            child = current_path / name
+            if name.lower() in skip_names:
+                continue
+            if output is not None:
+                try:
+                    if child.resolve() == output:
+                        continue
+                except OSError:
+                    pass
+            kept.append(name)
+        dirs[:] = kept if recursive else []
+        for name in files:
+            path = current_path / name
+            if path.suffix.lower() in SKIP_DISCOVERY_EXTENSIONS:
+                continue
+            try:
+                canonical = path.resolve()
+            except OSError:
+                canonical = path
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            _push_classified(path, allow_shellcode, report)
+
+    report.samples.sort(key=lambda s: s.path)
+    report.rejected.sort(key=lambda r: r.path)
+    return report
+
+
+def format_size(size: float) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB"):
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
