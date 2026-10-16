@@ -576,8 +576,13 @@ class OmniApp:
         self._update_analyze_workspace_state()
         self._bind_provider_visibility()
         if self.settings.input_path.strip():
-            self.refresh_samples()
+            if not Path(self.settings.input_path.strip()).exists():
+                self.settings.input_path = ""
+                self.v_input.set("")
+            else:
+                self.refresh_samples()
         self.show_tab("Queue")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll)
 
     def _load_app_logos(self) -> None:
@@ -1395,12 +1400,44 @@ class OmniApp:
         self.test_badge.configure(bg=bg_c, highlightthickness=1, highlightbackground=border_c)
         self.test_badge_lbl.configure(text=f"{icon}{display_msg}", bg=bg_c, fg=fg_c)
 
+    def on_close(self) -> None:
+        """Gracefully handle window close: save configuration and terminate cleanly."""
+        try:
+            self._pull_settings()
+            self.settings.save()
+        except Exception:
+            pass
+        if self.cancel:
+            self.cancel.set()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     # ------------------------------------------------------------ samples
     def refresh_samples(self) -> None:
         self._pull_settings()
         s = self.settings
+        target_path = s.input_path.strip()
+        if not target_path:
+            self.samples, self.rejected = [], []
+            self.v_queued.set("0 sample(s) queued")
+            self._mark_queue()
+            self._build_controls()
+            self._update_tab_titles()
+            return
+
+        if not Path(target_path).exists():
+            self.samples, self.rejected = [], []
+            self.v_queued.set("0 sample(s) queued")
+            self._mark_queue()
+            self._build_controls()
+            self._update_tab_titles()
+            self._add_logs([f"Input path not found on disk: {target_path}"])
+            return
+
         try:
-            report = discover(s.input_path.strip(), s.recursive, s.output_root.strip() or None, s.allow_shellcode)
+            report = discover(target_path, s.recursive, s.output_root.strip() or None, s.allow_shellcode)
         except OSError as error:
             self.samples, self.rejected = [], []
             self._add_logs([f"Discovery error: {error}"])

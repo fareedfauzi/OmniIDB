@@ -19,6 +19,9 @@
 
 **OmniIDB** is a standalone, pure-Python desktop workbench and headless batch orchestrator for automated reverse engineering and database enrichment in **Hex-Rays IDA Pro**. It processes single binaries or entire malware sample repositories unattended, executing semantic subroutine renaming, Hex-Rays variable recovery, offline AI workspace generation, and autonomous multi-turn investigations.
 
+> [!NOTE]
+> **Based on Genesect**: OmniIDB is built upon the concepts and reverse-engineering capabilities of [Genesect](https://github.com/fareedfauzi/Genesect). While **Genesect** focuses on interactive, in-IDE real-time AI assistance as an active IDA Pro plugin, **OmniIDB** is purpose-built for **bulk sample triage and automated IDB persistence (`.i64`)**—running headlessly across queues of binaries unattended.
+
 OmniIDB requires **no third-party pip dependencies** to run its GUI or core engine—it runs on the standard Python distribution bundled with Windows or IDA Pro.
 
 ---
@@ -26,6 +29,7 @@ OmniIDB requires **no third-party pip dependencies** to run its GUI or core engi
 ## Table of Contents
 
 - [Key Features](#key-features)
+- [Relationship to Genesect & Acknowledgements](#relationship-to-genesect--acknowledgements)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [Analysis Operations](#analysis-operations)
@@ -305,6 +309,25 @@ python -m py_compile omni_idb\app.py omni_idb\config.py omni_idb\runner.py scrip
 
 #### 4. "CLI Agent Workspace Analysis is disabled"
 - Direct API providers (OpenAI, Anthropic, DeepSeek, etc.) do not have local file system access and would consume excessive tokens. To enable **Proceed analysis of the Exported AI workspace**, select a local CLI agent provider (**AntigravityCLI**, **ClaudeCode**, or **OpenCode**).
+
+---
+
+## Relationship to Genesect & Acknowledgements
+
+OmniIDB is built upon and inspired by [Genesect](https://github.com/fareedfauzi/Genesect) by **Fareed Fauzi**.
+
+| Capability / Attribute | [Genesect](https://github.com/fareedfauzi/Genesect) | OmniIDB |
+| :--- | :--- | :--- |
+| **Primary Mission** | In-IDE interactive reverse engineering assistant | Autonomous bulk batch sample analysis & database preservation |
+| **Target Scale** | Single binary under manual analyst inspection | Batch queues across entire directories or repositories of samples |
+| **Workflow Model** | Interactive human-in-the-loop chat & function queries | Headless, unattended automation pipeline with live telemetry |
+| **User Interface** | Embedded dockable IDA Pro plugin panel | Standalone desktop GUI & standalone portable `.exe` workbench |
+| **IDB Persistence** | Modifies active open database inside IDA session | Preserves paired `original.i64` and fully enriched `analyzed.i64` |
+| **Artifacts** | Live function comments, renames in active session | Enriched IDBs, offline C workspaces, MITRE ATT&CK dossiers (HTML/PDF/MD) |
+
+### How They Complement Each Other
+- **[Genesect](https://github.com/fareedfauzi/Genesect)** is the ideal companion when you are actively reverse engineering a specific binary inside IDA Pro and want an AI assistant to explain functions, answer questions, or rename code in real time.
+- **OmniIDB** takes these core decompilation and AI capabilities and scales them for triage: drop dozens or hundreds of unknown malware samples into OmniIDB, run the batch headless, and receive fully deobfuscated and annotated `analyzed.i64` databases, structured offline workspaces, and executive reports without manual intervention.
 
 ---
 

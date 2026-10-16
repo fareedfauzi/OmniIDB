@@ -444,6 +444,12 @@ def _handle_ida_line(index: int, line: str, q) -> None:
 # --------------------------------------------------------------------------
 
 def _python_cmd() -> list[str]:
+    if getattr(sys, "frozen", False):
+        for candidate in ("python", "python3", "py"):
+            found = shutil.which(candidate)
+            if found:
+                return [found]
+        return ["python"]
     return [sys.executable or "python"]
 
 
@@ -456,8 +462,38 @@ def _script_env(genesect_root, ida_path: str = "") -> dict:
     return env
 
 
+def _load_auth_cli_module(genesect_root: Path | str, ida_path: str = ""):
+    """Dynamically load scripts/auth_cli.py for direct, in-process execution."""
+    script = auth_script(genesect_root)
+    package_root = find_genesect_package_root(genesect_root, Path(ida_path).parent if ida_path.strip() else "")
+    if package_root and str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+
+    if not script.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("omni_idb_auth_cli", str(script))
+        if spec and spec.loader:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    except Exception:
+        pass
+    return None
+
+
 def start_chatgpt_auth(genesect_root: Path | str, q, ida_path: str = "") -> None:
     def work() -> None:
+        try:
+            mod = _load_auth_cli_module(genesect_root, ida_path)
+            if mod:
+                from genesect import chatgpt_oauth
+                data = chatgpt_oauth.sign_in_interactive()
+                _post(q, "auth_finished", ok=True, message="ChatGPT sign-in complete.")
+                return
+        except Exception:
+            pass
+
         script = auth_script(genesect_root)
         try:
             out = subprocess.run(
@@ -475,6 +511,27 @@ def start_chatgpt_auth(genesect_root: Path | str, q, ida_path: str = "") -> None
 
 def start_test_connection(genesect_root: Path | str, payload: dict, q, ida_path: str = "") -> None:
     def work() -> None:
+        target = payload.get("target", "main")
+        # 1. Prefer in-process execution (avoids re-invoking frozen executable)
+        try:
+            mod = _load_auth_cli_module(genesect_root, ida_path)
+            if mod and hasattr(mod, "test_connection"):
+                res = mod.test_connection(payload)
+                if isinstance(res, dict):
+                    _post(
+                        q,
+                        "test_connection_result",
+                        ok=bool(res.get("ok", False)),
+                        message=str(res.get("message", "Unknown result")),
+                        resolved_model=res.get("model") if isinstance(res.get("model"), str) else None,
+                        available_models=res.get("available_models") if isinstance(res.get("available_models"), list) else [],
+                        target=target,
+                    )
+                    return
+        except Exception:
+            pass
+
+        # 2. Subprocess fallback
         script = auth_script(genesect_root)
         try:
             out = subprocess.run(
@@ -487,7 +544,7 @@ def start_test_connection(genesect_root: Path | str, payload: dict, q, ida_path:
                 errors="replace",
             )
         except OSError as error:
-            _post(q, "test_connection_result", ok=False, message=f"Could not start Python: {error}", resolved_model=None)
+            _post(q, "test_connection_result", ok=False, message=f"Could not probe connection: {error}", resolved_model=None, target=target)
             return
         parsed = None
         for line in out.stdout.splitlines():
@@ -498,7 +555,6 @@ def start_test_connection(genesect_root: Path | str, payload: dict, q, ida_path:
             if isinstance(candidate, dict):
                 parsed = candidate
                 break
-        target = payload.get("target", "main")
         if parsed is not None:
             _post(
                 q,
