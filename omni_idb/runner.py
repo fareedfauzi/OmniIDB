@@ -88,7 +88,8 @@ def _run_all(request: RunRequest, q, cancelled: threading.Event) -> None:
         if cancelled.is_set():
             break
         _post(q, "sample_started", index=index, path=sample.path)
-        _post(q, "progress", current=index, total=total, message=f"Opening {sample.path} in IDA")
+        init_msg = f"Processing {sample.path.name}" if sample.kind == SampleKind.DOTNET_ASSEMBLY else f"Opening {sample.path.name} in IDA"
+        _post(q, "progress", current=index, total=total, message=init_msg)
         try:
             message, sample_result = _run_one(index, sample, request, q, cancelled, remaining_budget=remaining_budget)
             if sample_result and isinstance(sample_result, dict):
@@ -220,14 +221,6 @@ def _pipe_lines(stream, out: "queue.Queue[str]") -> None:
 
 def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: threading.Event, remaining_budget: Optional[int] = None) -> tuple[str, dict]:
     settings = request.settings
-    ida = Path(settings.ida_path.strip())
-    if not ida.is_file():
-        raise FileNotFoundError(f"IDA executable not found: {ida}")
-    genesect_root = Path(settings.genesect_root.strip())
-    script = runner_script(genesect_root)
-    if not script.is_file():
-        raise FileNotFoundError(f"OmniIDB batch script not found: {script}")
-
     digest = sha256_file(sample.path)
     folder = f"{sanitize(sample.path.stem)}-{digest[:12]}"
     output_root = Path(settings.output_root.strip()) / folder
@@ -242,6 +235,48 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
     result_path = output_root / "result.json"
     failure_path = logs / "failure.txt"
     ida_log = logs / "ida.log"
+
+    # .NET Assembly special handling (does not require IDA Pro)
+    if sample.kind == SampleKind.DOTNET_ASSEMBLY:
+        dotnet_mode = getattr(settings, "dotnet_mode", "skip")
+        if dotnet_mode == "skip":
+            _post(q, "sample_status", index=index, status="Skipped (.NET)")
+            _post(q, "sample_stage", index=index, stage="Skipped")
+            skip_msg = f"Skipping {sample.path.name}: .NET assembly detected (IDA Pro Hex-Rays targets native binaries)."
+            _post(q, "log", message=skip_msg)
+            return f"Skipped .NET assembly ({sample.path.name})", {"status": "skipped", "reason": "dotnet_assembly"}
+        elif dotnet_mode == "decompile":
+            _post(q, "sample_status", index=index, status="Decompiling .NET")
+            _post(q, "sample_stage", index=index, stage="Exporting .NET Workspace")
+            _post(q, "log", message=f"Decompiling .NET assembly & exporting AI workspace: {sample.path.name}")
+            from .dotnet_export import export_dotnet_workspace
+            ws_meta = export_dotnet_workspace(sample.path, output_root, log_fn=lambda m: _post(q, "log", message=m))
+            res = {
+                "sample": str(sample.path),
+                "is_dotnet": True,
+                "workspace_path": ws_meta.get("workspace_dir", ""),
+                "types_count": ws_meta.get("types_count", 0),
+                "pinvokes_count": ws_meta.get("pinvokes_count", 0),
+                "strings_count": ws_meta.get("strings_count", 0),
+                "cs_count": ws_meta.get("cs_count", 0),
+            }
+            result_path.write_text(json.dumps(res, indent=2), encoding="utf-8")
+            parts = [
+                f"{res['types_count']} types",
+                f"{res['pinvokes_count']} P/Invokes",
+                f"{res['strings_count']} strings",
+            ]
+            if res["cs_count"] > 0:
+                parts.append(f"{res['cs_count']} C# files")
+            return f"Exported .NET AI Workspace ({', '.join(parts)})", res
+
+    ida = Path(settings.ida_path.strip())
+    if not ida.is_file():
+        raise FileNotFoundError(f"IDA executable not found: {ida}")
+    genesect_root = Path(settings.genesect_root.strip())
+    script = runner_script(genesect_root)
+    if not script.is_file():
+        raise FileNotFoundError(f"OmniIDB batch script not found: {script}")
 
     # Output folders are deterministic. IDA prompts instead of overwriting an
     # existing database and a stale failure file can mask a new failure, so
@@ -271,6 +306,7 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
         "asm_max_lines": 25,
         "use_rename_cache": getattr(settings, "use_rename_cache", True),
         "cache_path": str(cache_path().resolve()),
+        "goresym_path": getattr(settings, "goresym_path", ""),
         "token_budget": remaining_budget if remaining_budget is not None else int(getattr(settings, "token_budget", 0) or 0),
         "provider": settings.provider,
         "profile": {

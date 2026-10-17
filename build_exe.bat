@@ -61,8 +61,10 @@ set ICON_ARG=
 if exist "omni-IDB-logo.ico" set ICON_ARG=--icon="omni-IDB-logo.ico"
 set FONT_ARG=
 if exist "JetBrainsMono.ttf" set FONT_ARG=--add-data "JetBrainsMono.ttf;."
+set GORESYM_ARG=
+if exist "GoReSym.exe" set GORESYM_ARG=--add-data "GoReSym.exe;."
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name OmniIDB !ICON_ARG! !FONT_ARG! --add-data "scripts;scripts" --add-data "omni-IDB-logo.png;." --add-data "omni-IDB-logo.ico;." --collect-all omni_idb omni_idb\__main__.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name OmniIDB !ICON_ARG! !FONT_ARG! !GORESYM_ARG! --add-data "scripts;scripts" --add-data "omni-IDB-logo.png;." --add-data "omni-IDB-logo.ico;." --collect-all omni_idb omni_idb\__main__.py
 
 if errorlevel 1 (
     echo.

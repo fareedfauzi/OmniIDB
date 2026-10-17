@@ -487,7 +487,12 @@ class QueueView(tk.Frame):
             title, width, minw = heads[col]
             self.tree.heading(col, text=title)
             self.tree.column(col, width=width, minwidth=minw, anchor="w", stretch=False)
-        for tag, (bg, fg) in {"done": STATUS_COLORS["Complete"], "fail": STATUS_COLORS["Failed"], "run": RUNNING_COLORS}.items():
+        for tag, (bg, fg) in {
+            "done": STATUS_COLORS["Complete"],
+            "fail": STATUS_COLORS["Failed"],
+            "run": RUNNING_COLORS,
+            "skip": (AMBER_BG, AMBER),
+        }.items():
             self.tree.tag_configure(tag, background=bg, foreground=fg)
 
         yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview, style="Vertical.TScrollbar")
@@ -562,7 +567,17 @@ class QueueView(tk.Frame):
             return
         self.empty_frame.place_forget()
         for index, sample in rows:
-            tag = "done" if sample.is_complete() else "fail" if sample.is_failed() else "run" if sample.is_running() else ""
+            tag = (
+                "done"
+                if sample.is_complete()
+                else "fail"
+                if sample.is_failed()
+                else "skip"
+                if sample.is_skipped()
+                else "run"
+                if sample.is_running()
+                else ""
+            )
             display_status = (
                 sample.stage
                 if sample.is_running() and sample.stage and sample.stage != "-"
@@ -861,9 +876,12 @@ class OmniApp:
     # ------------------------------------------------------------ state
     def _build_vars(self) -> None:
         s = self.settings
+        from .go_support import resolve_goresym
         self.v_input = tk.StringVar(value=s.input_path)
         self.v_output = tk.StringVar(value=s.output_root)
         self.v_ida = tk.StringVar(value=s.ida_path or str(detect_ida() or ""))
+        go_path = s.goresym_path if (s.goresym_path and "_MEI" not in s.goresym_path and Path(s.goresym_path).is_file()) else resolve_goresym()
+        self.v_goresym = tk.StringVar(value=go_path)
         self.v_provider = tk.StringVar(value=s.provider)
         self.v_url = tk.StringVar(value=s.api_url)
         self.v_key = tk.StringVar()
@@ -884,6 +902,7 @@ class OmniApp:
         self.v_report_mode = tk.StringVar(value="none")
         self.v_agent = tk.BooleanVar(value=False)
         self.v_analyze_workspace = tk.BooleanVar(value=False)
+        self.v_dotnet_mode = tk.StringVar(value=getattr(s, "dotnet_mode", "skip") or "skip")
         self.v_turns = tk.IntVar(value=s.investigation_turns)
         self.v_recursive = tk.BooleanVar(value=s.recursive)
         self.v_shellcode = tk.BooleanVar(value=s.allow_shellcode)
@@ -903,6 +922,7 @@ class OmniApp:
         s.input_path = self.v_input.get()
         s.output_root = self.v_output.get()
         s.ida_path = self.v_ida.get()
+        s.goresym_path = self.v_goresym.get()
         if not s.genesect_root:
             s.genesect_root = str(detect_engine_root() or project_root())
         s.provider = self.v_provider.get()
@@ -925,6 +945,7 @@ class OmniApp:
             and self.v_workspace.get()
             and is_cli_provider(self.v_provider.get())
         )
+        s.dotnet_mode = self.v_dotnet_mode.get()
         s.recursive = self.v_recursive.get()
         s.allow_shellcode = self.v_shellcode.get()
         s.shellcode_arch = self.v_arch.get()
@@ -1205,6 +1226,47 @@ class OmniApp:
         )
         self.ws_analysis_badge.pack(side="left", padx=6)
 
+        # .NET Assembly Handling Sub-section
+        ttk.Separator(ops_card).pack(fill="x", pady=(6, 8))
+        net_hdr = tk.Frame(ops_card, bg=CARD)
+        net_hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(net_hdr, text="⚙", bg=CARD, fg=SKY, font=CARD_ICON_FONT).pack(side="left", padx=(0, 10))
+        net_text = tk.Frame(net_hdr, bg=CARD)
+        net_text.pack(side="left", fill="x", expand=True)
+        tk.Label(net_text, text=".NET Assembly Handling", bg=CARD, fg=FG, font=TITLE_FONT).pack(anchor="w")
+        tk.Label(net_text, text="Behavior when target binary is a managed .NET executable or DLL", bg=CARD, fg=DIM, font=SUB_FONT).pack(anchor="w")
+
+        net_list = tk.Frame(ops_card, bg=CARD)
+        net_list.pack(fill="x", pady=(2, 4))
+
+        # 1. Skip .NET Assemblies
+        r_skip_net = tk.Frame(net_list, bg=CARD)
+        r_skip_net.pack(fill="x", pady=2)
+        ttk.Radiobutton(
+            r_skip_net,
+            text="Skip .NET Assemblies (native IDA Hex-Rays only)",
+            variable=self.v_dotnet_mode,
+            value="skip",
+        ).pack(side="left")
+        make_help_badge(
+            r_skip_net,
+            "Skips managed .NET executables. IDA Pro and Hex-Rays only target native x86/x64/ARM machine code.",
+        ).pack(side="left", padx=6)
+
+        # 2. Decompile & Export .NET AI Workspace
+        r_dec_net = tk.Frame(net_list, bg=CARD)
+        r_dec_net.pack(fill="x", pady=2)
+        ttk.Radiobutton(
+            r_dec_net,
+            text="Decompile & Export .NET AI Workspace (extract CIL, types, strings & C#)",
+            variable=self.v_dotnet_mode,
+            value="decompile",
+        ).pack(side="left")
+        make_help_badge(
+            r_dec_net,
+            "Pure-Python CLR metadata parser extracts TypeDefs, MethodDefs, P/Invoke imports, user strings, and CIL module signatures for AI agent inspection without requiring IDA Pro.",
+        ).pack(side="left", padx=6)
+
         # Output Directory Sub-section
         ttk.Separator(ops_card).pack(fill="x", pady=(6, 8))
         out_hdr = tk.Frame(ops_card, bg=CARD)
@@ -1235,28 +1297,46 @@ class OmniApp:
         ttk.Entry(ida_grid, textvariable=self.v_ida).grid(row=0, column=1, sticky="ew", padx=(4, 6))
         RoundedButton(ida_grid, "Browse...", command=lambda: self._pick_file(self.v_ida), bg_color=CARD, padx=8, pady=3, radius=6).grid(row=0, column=2)
 
-        # Row 2: AI Batch Size + hint
-        tk.Label(ida_grid, text="AI Batch Size:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=1, column=0, pady=(6, 0), sticky="w")
+        # Row 2: GoReSym Executable (for Go binaries)
+        tk.Label(ida_grid, text="GoReSym Binary:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=1, column=0, pady=3, sticky="w")
+        grow = tk.Frame(ida_grid, bg=CARD)
+        grow.grid(row=1, column=1, sticky="ew", padx=(4, 6))
+        grow.columnconfigure(0, weight=1)
+        ttk.Entry(grow, textvariable=self.v_goresym).grid(row=0, column=0, sticky="ew")
+        make_help_badge(
+            grow,
+            "Mandiant GoReSym CLI to recover original function names and types from stripped Go binaries.\n"
+            "Automatically detects GoReSym.exe in project root, tools/ directory, or system PATH.\n"
+            "Click 'Update' to auto-fetch or update to the latest official release from GitHub.",
+        ).grid(row=0, column=1, padx=(6, 0))
+        g_btns = tk.Frame(ida_grid, bg=CARD)
+        g_btns.grid(row=1, column=2)
+        RoundedButton(g_btns, "Browse...", command=lambda: self._pick_file(self.v_goresym), bg_color=CARD, padx=6, pady=3, radius=6).pack(side="left", padx=(0, 4))
+        self.btn_goresym_update = RoundedButton(g_btns, "⬇ Update", command=self._on_update_goresym, bg_color=CARD, padx=6, pady=3, radius=6)
+        self.btn_goresym_update.pack(side="left")
+
+        # Row 3: AI Batch Size + hint
+        tk.Label(ida_grid, text="AI Batch Size:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=2, column=0, pady=(6, 0), sticky="w")
         brow = tk.Frame(ida_grid, bg=CARD)
-        brow.grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        brow.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Spinbox(brow, from_=1, to=50, textvariable=self.v_batch, width=5).pack(side="left")
         make_help_badge(brow, "Sequential requests per IDA headless session to manage rate limits and memory.").pack(side="left", padx=6)
         tk.Label(brow, text="Sequential requests per IDA session", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
 
-        # Row 3: Rename Cache
-        tk.Label(ida_grid, text="Rename Cache:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=2, column=0, pady=(6, 0), sticky="w")
+        # Row 4: Rename Cache
+        tk.Label(ida_grid, text="Rename Cache:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=3, column=0, pady=(6, 0), sticky="w")
         crow = tk.Frame(ida_grid, bg=CARD)
-        crow.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        crow.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(crow, text="Reuse function & variable names across samples", variable=self.v_cache).pack(side="left")
         make_help_badge(crow, "Cross-sample consensus cache: skips re-querying AI when identical or structurally matching decompiled code has already been analyzed.").pack(side="left", padx=6)
         RoundedButton(crow, "Clear Cache", command=self._on_clear_cache, bg_color=CARD, padx=6, pady=2, radius=4).pack(side="left", padx=(6, 6))
         self.cache_stats_lbl = tk.Label(crow, text=self._format_cache_stats(), bg=CARD, fg=DIM, font=SUB_FONT)
         self.cache_stats_lbl.pack(side="left")
 
-        # Row 4: Token Budget
-        tk.Label(ida_grid, text="Token Budget:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=3, column=0, pady=(6, 0), sticky="w")
+        # Row 5: Token Budget
+        tk.Label(ida_grid, text="Token Budget:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=4, column=0, pady=(6, 0), sticky="w")
         trow = tk.Frame(ida_grid, bg=CARD)
-        trow.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        trow.grid(row=4, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Spinbox(trow, from_=0, to=10000000, increment=50000, textvariable=self.v_token_budget, width=10).pack(side="left")
         make_help_badge(trow, "Batch-wide token spending cap. 0 = unlimited. When exhausted, switches to free fallback or stops billable requests.").pack(side="left", padx=6)
         tk.Label(trow, text="Batch token cap (0 = unlimited)", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
@@ -1388,6 +1468,7 @@ class OmniApp:
         for key, label, color, pred in (
             ("Failed", "✗ Fail", "#7F1D1D", Sample.is_failed),
             ("Complete", "✓ Done", "#166534", Sample.is_complete),
+            ("Skipped", "↷ Skip", "#78350F", Sample.is_skipped),
             ("Running", "⚡ Run", "#1E3A8A", Sample.is_running),
             ("Pending", "⏳ Ready", "#2A374E", Sample.is_pending),
         ):
@@ -1433,12 +1514,17 @@ class OmniApp:
         if not hasattr(self, "rb_ws_analysis"):
             return
         provider = self.v_provider.get()
-        cli_mode = is_cli_provider(provider)
+        fb_enabled = self.v_fallback_enabled.get()
+        fb_provider = self.v_fallback_provider.get()
+
+        # Enabled if either main provider or fallback provider is a CLI agent
+        cli_mode = is_cli_provider(provider) or (fb_enabled and is_cli_provider(fb_provider))
         if cli_mode:
             self.rb_ws_analysis.configure(state="normal")
+            cli_name = provider if is_cli_provider(provider) else f"{fb_provider} (Fallback)"
             if hasattr(self.ws_analysis_badge, "tooltip"):
                 self.ws_analysis_badge.tooltip.text = (
-                    "Instructs the autonomous CLI agent (Claude Code, Antigravity CLI, OpenCode, Copilot CLI) "
+                    f"Instructs the autonomous CLI agent ({cli_name}) "
                     "to inspect the exported workspace and generate a structured malware research report.\n"
                     "Selecting this mode automatically enables 'Export OmniIDB AI workspace'."
                 )
@@ -1450,10 +1536,11 @@ class OmniApp:
             self.rb_ws_analysis.configure(state="disabled")
             if hasattr(self.ws_analysis_badge, "tooltip"):
                 self.ws_analysis_badge.tooltip.text = (
-                    "⚠ Disabled for direct API providers to prevent excessive token consumption.\n"
-                    "Select a CLI Agent provider (Claude Code, Antigravity CLI, OpenCode, Copilot CLI) to enable."
+                    "⚠ Select a CLI Agent provider (Claude Code, Antigravity CLI, OpenCode, Copilot CLI) "
+                    "as either Main Provider or Fallback Provider to enable."
                 )
             self.ws_analysis_badge.configure(fg=AMBER)
+
 
     def _toggle_status_filter(self, key: str) -> None:
         self.v_status_filter.set("All" if self.v_status_filter.get() == key and key != "All" else key)
@@ -1540,6 +1627,61 @@ class OmniApp:
             except Exception as exc:
                 messagebox.showerror("Cache Error", f"Could not clear cache: {exc}")
 
+    def _on_update_goresym(self) -> None:
+        """Download or update GoReSym binary from Mandiant's official GitHub releases."""
+        if hasattr(self, "btn_goresym_update") and self.btn_goresym_update.state == "disabled":
+            return
+
+        # Visual feedback: disable button & show "⏳ Updating..."
+        if hasattr(self, "btn_goresym_update"):
+            self.btn_goresym_update.configure_state("disabled")
+            self.btn_goresym_update.set_text("⏳ Updating...")
+
+        # Switch to activity log tab and log action
+        self.show_tab("Log")
+        self._add_logs([
+            "[*] Checking latest GoReSym release from Mandiant GitHub repository...",
+            "[*] Platform asset detected: " + ("GoReSym-windows.zip" if sys.platform == "win32" else ("GoReSym-mac.zip" if sys.platform == "darwin" else "GoReSym-linux.zip")),
+        ])
+
+        def run_update():
+            from .go_support import download_latest_goresym, resolve_goresym
+
+            def on_progress(p_msg: str) -> None:
+                self.root.after(0, lambda: self._add_logs([p_msg]))
+
+            try:
+                ok, msg = download_latest_goresym(on_progress=on_progress)
+            except Exception as e:
+                ok, msg = False, f"Unexpected error during download: {e}"
+
+            def done():
+                try:
+                    if hasattr(self, "btn_goresym_update"):
+                        self.btn_goresym_update.configure_state("normal")
+                        self.btn_goresym_update.set_text("⬇ Update")
+
+                    if ok:
+                        new_path = resolve_goresym()
+                        self.v_goresym.set(new_path)
+                        self._pull_settings()
+                        self._save_settings()
+                        self._add_logs([
+                            f"[+] {msg}",
+                            f"[+] GoReSym binary active: {new_path}",
+                        ])
+                        messagebox.showinfo("GoReSym Updated", msg, parent=self.root)
+                    else:
+                        self._add_logs([f"[-] Error updating GoReSym: {msg}"])
+                        messagebox.showwarning("GoReSym Update Failed", msg, parent=self.root)
+                except Exception as ex:
+                    self._add_logs([f"[-] Error in update callback: {ex}"])
+
+            self.root.after(0, done)
+
+        import threading
+        threading.Thread(target=run_update, daemon=True).start()
+
     def choose_input_file(self) -> None:
         path = filedialog.askopenfilename(
             title="Select Target Executable Sample or IDA Database",
@@ -1605,6 +1747,7 @@ class OmniApp:
             self.test_badge.grid(row=0, column=1, sticky="ew", padx=(10, 0))
             self.trow.columnconfigure(1, weight=1)
             self.trow.columnconfigure(2, weight=0)
+        self._update_analyze_workspace_state()
 
     def _fallback_provider_changed(self) -> None:
         self.settings.fallback_provider = self.v_fallback_provider.get()
@@ -1616,6 +1759,8 @@ class OmniApp:
         if hasattr(self, "fb_model_box"):
             self.fb_model_box["values"] = default_models_for_provider(self.v_fallback_provider.get())
         self._fallback_layout()
+        self._update_analyze_workspace_state()
+
 
     def _fallback_layout(self) -> None:
         if not self.v_fallback_enabled.get():
@@ -1840,6 +1985,7 @@ class OmniApp:
             "Running": Sample.is_running,
             "Complete": Sample.is_complete,
             "Failed": Sample.is_failed,
+            "Skipped": Sample.is_skipped,
         }
         pred = preds.get(mode, preds["All"])
         return [(i, s) for i, s in enumerate(self.samples) if (not needle or needle in str(s.path).lower()) and pred(s)]
@@ -2033,13 +2179,15 @@ class OmniApp:
             idx = d["index"]
             if 0 <= idx < len(self.samples):
                 s = self.samples[idx]
-                s.status = "Complete" if d["ok"] else "Failed"
-                s.stage = "Completed" if d["ok"] else "Failed"
+                if not s.is_skipped():
+                    s.status = "Complete" if d["ok"] else "Failed"
+                    s.stage = "Completed" if d["ok"] else "Failed"
                 if s.start_time is not None:
                     s.elapsed_seconds = time.time() - s.start_time
                 self._mark_queue()
             self.progress_current = idx + 1
-            new_logs.append(("✓ " if d["ok"] else "✗ ") + d["message"])
+            icon = "↷ " if (0 <= idx < len(self.samples) and self.samples[idx].is_skipped()) else ("✓ " if d["ok"] else "✗ ")
+            new_logs.append(icon + d["message"])
         elif kind == "batch_finished":
             self.running = False
             self.cancel = None

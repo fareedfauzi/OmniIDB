@@ -365,15 +365,92 @@ def run_workspace_export(exporter, workspace_path):
     return exporter(workspace_path, None)
 
 
+def pre_process_rust_symbols():
+    """Detect and demangle Rust symbols into clean IDA function names before LLM analysis."""
+    import idautils
+    import idc
+    import ida_name
+    from omni_idb import rust_support as rs
+
+    candidates = []
+    for ea in idautils.Functions():
+        name = idc.get_func_name(ea) or ""
+        if rs.looks_like_rust_mangled(name):
+            candidates.append((ea, name))
+
+    if not candidates:
+        return 0
+
+    emit("log", "Detected %d mangled Rust symbols; applying automated demangling..." % len(candidates), level="info")
+    renamed = 0
+    for ea, name in candidates:
+        demangled = rs.demangle_rust_symbol(name)
+        if demangled and demangled != name:
+            safe_name = rs.ida_safe_rust_name(demangled, ea)
+            ok = ida_name.set_name(ea, safe_name, ida_name.SN_NOWARN | ida_name.SN_FORCE)
+            if ok:
+                renamed += 1
+    if renamed > 0:
+        emit("log", "Successfully demangled %d Rust symbols" % renamed, level="ok")
+    return renamed
+
+
+def pre_process_go_symbols(sample_path, goresym_path=""):
+    """Detect Go binary and restore pclntab symbols if GoReSym is available."""
+    from omni_idb import go_support as gs
+    import ida_name
+
+    goresym_exe = gs.resolve_goresym(goresym_path)
+    if not goresym_exe:
+        return 0
+
+    emit("log", "GoReSym detected; recovering pclntab function names and types...", level="info")
+    data = gs.run_goresym_restore(sample_path, goresym_exe)
+    if not data:
+        return 0
+
+    renamed = 0
+    funcs = data.get("UserFunctions") or []
+    if not funcs and data.get("StdFunctions"):
+        funcs = data.get("StdFunctions") or []
+    for f in funcs:
+        ea = f.get("Start")
+        fullname = f.get("FullName")
+        if ea and fullname:
+            safe = fullname.replace(" ", "_").replace("(", "").replace(")", "").replace("*", "")
+            if ida_name.set_name(ea, safe, ida_name.SN_NOWARN | ida_name.SN_FORCE):
+                renamed += 1
+    if renamed > 0:
+        emit("log", "GoReSym restored %d Go function symbols" % renamed, level="ok")
+    return renamed
+
+
 def collect_sub_functions(renamer):
     import idautils
     import idc
+    from omni_idb import rust_support as rs
+    from omni_idb import go_support as gs
 
     result = []
+    skipped_rust_noise = 0
+    skipped_go_noise = 0
     for ea in idautils.Functions():
         name = idc.get_func_name(ea) or ""
         if name.startswith("sub_") and renamer.is_valid_seg(ea):
+            # If function is identifiable as Rust stdlib/runtime boilerplate, skip it
+            if rs.is_rust_noise_function(name):
+                skipped_rust_noise += 1
+                continue
+            # If function is identifiable as Go stdlib/runtime boilerplate, skip it
+            if gs.is_go_noise_function(name):
+                skipped_go_noise += 1
+                continue
             result.append((int(ea), name))
+
+    if skipped_rust_noise > 0:
+        emit("log", "Pruned %d Rust stdlib/runtime boilerplate function(s) from AI queue" % skipped_rust_noise, level="info")
+    if skipped_go_noise > 0:
+        emit("log", "Pruned %d Go stdlib/runtime boilerplate function(s) from AI queue" % skipped_go_noise, level="info")
     return result
 
 
@@ -1313,13 +1390,23 @@ def _build_workspace_context_prompt(ws, base_prompt):
 def run_workspace_analysis(job, cfg, renamer, workspace_path):
     """Analyze the exported AI workspace and write a technical malware analysis report using a CLI Agent."""
     profile = job.get("profile") or {}
+    fb_profile = job.get("fallback_profile") or {}
+
     provider = str(profile.get("provider") or job.get("provider") or PROVIDER_INFO.get("active") or "").strip()
     executable = str(profile.get("executable") or job.get("executable") or "").strip()
     model = str(profile.get("model") or job.get("model") or "").strip()
+
+    # If primary is not a CLI agent (e.g. ChatGPTAccount), but fallback is a CLI agent (e.g. AntigravityCLI)
+    if provider not in CLI_PROVIDERS and job.get("fallback_enabled") and fb_profile.get("provider") in CLI_PROVIDERS:
+        provider = str(fb_profile.get("provider")).strip()
+        executable = str(fb_profile.get("executable") or "").strip()
+        model = str(fb_profile.get("model") or "").strip()
+
     ws = Path(workspace_path)
 
     emit("stage", "Analyzing exported AI workspace with %s" % (provider or "AI"), stage="workspace_analysis")
     emit("log", "Invoking %s on exported workspace: %s" % (provider or "AI", workspace_path))
+
 
     system_prompt = (
         "You are a senior malware analyst and threat intelligence researcher specializing in "
@@ -1448,6 +1535,19 @@ def main():
 
     cfg = configure_provider(job, CONFIG)
     install_provider_adapter(CONFIG, cfg, renamer, var_renamer, repo_root, job)
+
+    # Demangle or recover Rust / Go symbols before building call graph and rename queue
+    try:
+        pre_process_rust_symbols()
+    except Exception as exc:
+        emit("log", "Rust symbol pre-processing skipped: %s" % exc, level="warning")
+
+    try:
+        sample_file = job.get("sample_path", "")
+        if sample_file:
+            pre_process_go_symbols(sample_file, job.get("goresym_path", ""))
+    except Exception as exc:
+        emit("log", "Go symbol pre-processing skipped: %s" % exc, level="warning")
 
     emit("stage", "Scanning functions", stage="scan")
     sub_functions = collect_sub_functions(renamer)

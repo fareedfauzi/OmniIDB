@@ -16,6 +16,7 @@ MAX_SHELLCODE_SIZE = 256 * 1024 * 1024
 
 class SampleKind(enum.Enum):
     EXECUTABLE = ("Executable", "executable")
+    DOTNET_ASSEMBLY = (".NET assembly", "dotnet_assembly")
     IDA_DATABASE = ("IDA database", "ida_database")
     SHELLCODE = ("Raw shellcode", "shellcode")
 
@@ -52,6 +53,9 @@ class Sample:
 
     def is_failed(self) -> bool:
         return self.status == "Failed"
+
+    def is_skipped(self) -> bool:
+        return self.status.startswith("Skipped")
 
     def time_spent(self) -> str:
         if self.elapsed_seconds is not None:
@@ -134,6 +138,33 @@ def _valid_pe(data: bytes, file_size: int) -> bool:
     return struct.unpack_from("<H", data, optional)[0] in (0x010B, 0x020B)
 
 
+def _is_dotnet_pe(data: bytes) -> bool:
+    """Return True if the PE contains a non-empty CLR COM Descriptor entry."""
+    if len(data) < 0x40 or not data.startswith(b"MZ"):
+        return False
+    offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if offset < 0x40 or offset + 24 > len(data):
+        return False
+    if data[offset : offset + 4] != b"PE\0\0":
+        return False
+    optional = offset + 24
+    if optional + 2 > len(data):
+        return False
+    magic = struct.unpack_from("<H", data, optional)[0]
+    if magic == 0x010B:
+        data_dir = optional + 96
+    elif magic == 0x020B:
+        data_dir = optional + 112
+    else:
+        return False
+    # IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR is directory index 14 (8 bytes per entry)
+    com_dir = data_dir + 14 * 8
+    if com_dir + 8 > len(data):
+        return False
+    va, size = struct.unpack_from("<II", data, com_dir)
+    return va != 0 and size != 0
+
+
 def _valid_elf(data: bytes) -> bool:
     if len(data) < 52 or not data.startswith(b"\x7fELF"):
         return False
@@ -206,7 +237,11 @@ def classify_sample(path: Path | str, allow_shellcode: bool) -> SampleKind:
     label = _known_non_sample(data)
     if label:
         raise ClassifyError(f"{label} is not an executable sample")
-    if _valid_pe(data, size) or _valid_elf(data) or _valid_macho(data):
+    if _valid_pe(data, size):
+        if _is_dotnet_pe(data):
+            return SampleKind.DOTNET_ASSEMBLY
+        return SampleKind.EXECUTABLE
+    if _valid_elf(data) or _valid_macho(data):
         return SampleKind.EXECUTABLE
 
     ext = path.suffix.lstrip(".").lower()

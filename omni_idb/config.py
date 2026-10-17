@@ -100,6 +100,17 @@ def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def app_dir() -> Path:
+    """Return the actual directory where the executable or script is installed/located.
+
+    Unlike project_root(), this does NOT point to PyInstaller's temporary _MEIPASS extraction folder.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+
 def _config_dir(app: str) -> Path:
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
@@ -205,6 +216,8 @@ class AppSettings:
     generate_workspace: bool = False
     analyze_workspace: bool = False
     autonomous_investigation: bool = False
+    dotnet_mode: str = "skip"  # "skip" | "decompile"
+    goresym_path: str = ""
     investigation_turns: int = 10
     recursive: bool = True
     allow_shellcode: bool = False
