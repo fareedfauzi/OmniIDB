@@ -184,6 +184,13 @@ def render_markdown(model: Dict[str, Any]) -> str:
     prov = model.get("provider", {})
     rows = [("Report schema", model.get("schema")), ("AI synthesis", model.get("synthesis_status")),
             ("Primary provider", prov.get("primary")), ("Providers used", ", ".join(prov.get("used", [])))]
+    usage = model.get("usage")
+    if usage and usage.get("total_tokens"):
+        cost_str = " (~$%.3f)" % usage["estimated_cost_usd"] if usage.get("estimated_cost_usd", 0) > 0 else ""
+        rows.append(("Tokens (est.)", "%d (%d billable)%s" % (usage.get("total_tokens", 0), usage.get("billable_tokens", 0), cost_str)))
+    cache = model.get("cache")
+    if cache and cache.get("total_hits"):
+        rows.append(("Cache hits", str(cache.get("total_hits", 0))))
     rows += [(k.replace("_", " ").capitalize(), v) for k, v in sorted(stats.items())]
     L.extend(_table(["Field", "Value"], [[k, v] for k, v in rows if v not in (None, "")]))
     if prov.get("fallback_events"):
@@ -557,9 +564,14 @@ def _render_pdf_builtin(blocks: List[Block], model: Dict[str, Any], output: Path
 
 
 # ---------------------------------------------------------------- driver
-def render_reports(model: Any, out_dir: Path | str, log: Optional[Callable[[str], None]] = None) -> Dict[str, str]:
+def render_reports(
+    model: Any,
+    out_dir: Path | str,
+    log: Optional[Callable[[str], None]] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Dict[str, str]:
     """Render ``report.md/html/pdf`` into ``out_dir``. ``model`` is a dict or a JSON file path."""
-    log = log or (lambda _m: None)
+    logger = log_fn or log or (lambda _m: None)
     if not isinstance(model, dict):
         model = json.loads(Path(model).read_text(encoding="utf-8"))
     out = Path(out_dir)
@@ -573,9 +585,9 @@ def render_reports(model: Any, out_dir: Path | str, log: Optional[Callable[[str]
     try:
         engine = render_pdf(markdown, model, out / "report.pdf")
         paths["pdf"] = str(out / "report.pdf")
-        log("PDF rendered with %s engine" % engine)
+        logger("PDF rendered with %s engine" % engine)
     except Exception as error:  # noqa: BLE001 - PDF is best effort, md/html are already written
-        log("PDF rendering failed: %s" % error)
+        logger("PDF rendering failed: %s" % error)
     return paths
 
 

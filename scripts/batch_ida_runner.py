@@ -21,7 +21,7 @@ import traceback
 from pathlib import Path
 
 
-EVENT_PREFIX = "GENESECT_EVENT "
+EVENT_PREFIX = "OMNI_EVENT "
 
 
 def emit(kind, message, **fields):
@@ -56,7 +56,7 @@ def load_args():
         if args_path.is_file():
             return json.loads(args_path.read_text(encoding="utf-8"))
 
-    raise RuntimeError("Genesect batch runner did not receive a job JSON path.")
+    raise RuntimeError("OmniIDB batch runner did not receive a job JSON path.")
 
 
 def load_repository_module(repo_root, module_name):
@@ -297,12 +297,21 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
             )
         return str(result or "").strip(), profile_name
 
+    tracker = (job or {}).get("_tracker")
+
     def request(cfg, prompt, sys_prompt, logger=None, on_chunk=None,
                 on_cooldown=None, max_tokens=None, cancel_checker=None, **kwargs):
         del on_cooldown, kwargs
         while True:
             if cancel_checker and cancel_checker():
                 return ""
+            profile_name = worker_cfg.get("profile_name", "OpenAI")
+            url = worker_cfg.get("url") or ""
+            if tracker and not tracker.allowed(profile_name, url):
+                if switch_provider("token budget reached"):
+                    continue
+                from omni_idb.usage import BudgetExceeded
+                raise BudgetExceeded("Token budget reached (%d billable tokens)" % tracker.budget_tokens)
             try:
                 result, profile_name = dispatch(cfg, prompt, sys_prompt, logger, on_chunk, max_tokens, cancel_checker)
             except Exception as exc:  # noqa: BLE001 - any provider failure may trigger the fallback
@@ -318,6 +327,17 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
                     continue
             else:
                 state["empty"] = 0
+            if tracker and result:
+                try:
+                    tracker.record(
+                        provider=profile_name,
+                        model=worker_cfg.get("model") or "default",
+                        url=url,
+                        prompt_chars=len(prompt or "") + len(sys_prompt or ""),
+                        response_chars=len(result or ""),
+                    )
+                except Exception:
+                    pass
             if on_chunk and result and profile_name != "ChatGPTAccount":
                 on_chunk(result)
             return result
@@ -445,7 +465,17 @@ def apply_function_name(ea, name):
     return bool(ok), candidate
 
 
-def run_function_rename(sub_functions, cfg, renamer):
+def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None):
+    emit("stage", "Renaming functions", stage="functions")
+    import idaapi
+    import idc
+    from omni_idb.rename_cache import fingerprint, is_cacheable_name
+
+    try:
+        image_range = (int(idaapi.inf_get_min_ea()), int(idaapi.inf_get_max_ea()))
+    except Exception:
+        image_range = None
+
     pending = {}
     for ea, name in sub_functions:
         pending[ea] = renamer.FuncData(ea, name)
@@ -453,12 +483,36 @@ def run_function_rename(sub_functions, cfg, renamer):
     renamed = 0
     failed = 0
     round_index = 0
+    cache_hits = 0
+
+    if cache:
+        for func in list(pending.values()):
+            func.name = idc.get_func_name(func.ea) or func.name
+            func.code = renamer.get_code_fast(func.ea, 50000, asm_max=1000)
+            fp = fingerprint(func.code, own_name=func.name, user_functions=existing, image_range=image_range)
+            hit = cache.lookup_function(fp)
+            if hit:
+                hit_name, match_type = hit
+                ok, final_name = apply_function_name(func.ea, hit_name)
+                if ok:
+                    renamed += 1
+                    cache_hits += 1
+                    existing.add(final_name)
+                    RENAMED.append({"address": "0x%X" % func.ea, "old": func.name, "new": final_name})
+                    emit("log", "[cache %s] %s -> %s" % (match_type, func.name, final_name), level="ok")
+                    pending.pop(func.ea, None)
+        if cache_hits:
+            emit("log", "Function rename cache: reused %d name(s)" % cache_hits, level="ok")
 
     while pending:
+        if tracker and not tracker.allowed(cfg.get("profile_name", "OpenAI"), cfg.get("url") or ""):
+            emit("log", "Token budget reached; stopping function rename pass early", level="warning")
+            break
+
         round_index += 1
         ready = []
         for index, func in enumerate(list(pending.values())):
-            func.name = __import__("idc").get_func_name(func.ea) or func.name
+            func.name = idc.get_func_name(func.ea) or func.name
             func.code = renamer.get_code_fast(func.ea, 50000, asm_max=1000)
             func.strings = renamer.get_strings_fast(func.ea)
             func.calls = renamer.get_calls_fast(func.ea)
@@ -504,6 +558,12 @@ def run_function_rename(sub_functions, cfg, renamer):
                     existing.add(final_name)
                     RENAMED.append({"address": "0x%X" % func.ea, "old": func.name, "new": final_name})
                     emit("log", "%s -> %s (%s)" % (func.name, final_name, score or "unscored"), level="ok")
+                    if cache and is_cacheable_name(suggestion):
+                        try:
+                            fp = fingerprint(func.code, own_name=func.name, user_functions=existing, image_range=image_range)
+                            cache.store_function(fp, suggestion, score=score)
+                        except Exception:
+                            pass
                 else:
                     failed += 1
                     emit("log", "IDA rejected function name %s at 0x%X" % (suggestion, func.ea), level="error")
@@ -511,7 +571,7 @@ def run_function_rename(sub_functions, cfg, renamer):
                 failed += 1
                 emit("log", "No function rename produced for 0x%X" % func.ea, level="warning")
 
-        # A worker emits one terminal result per item.  Guard against provider
+        # A worker emits one terminal result per item. Guard against provider
         # or Qt failures so an unattended job cannot loop forever.
         for _index, func in ready:
             if func.ea not in processed:
@@ -519,53 +579,132 @@ def run_function_rename(sub_functions, cfg, renamer):
                 emit("log", "Function worker produced no result for 0x%X" % func.ea, level="error")
             pending.pop(func.ea, None)
 
-    return {"candidates": len(sub_functions), "renamed": renamed, "failed": failed}
+    return {"candidates": len(sub_functions), "renamed": renamed, "failed": failed, "cache_hits": cache_hits}
 
 
-def run_variable_rename(sub_functions, cfg, var_renamer):
+def run_variable_rename(sub_functions, cfg, var_renamer, cache=None, tracker=None):
+    emit("stage", "Renaming variables", stage="variables")
     import idc
+    import ida_hexrays
+    import idaapi
+    from omni_idb.rename_cache import fingerprint
 
-    items = []
+    try:
+        image_range = (int(idaapi.inf_get_min_ea()), int(idaapi.inf_get_max_ea()))
+    except Exception:
+        image_range = None
+    existing = all_existing_names()
+
+    all_items = []
     for index, (ea, original_name) in enumerate(sub_functions):
-        items.append((index, var_renamer.FuncData(ea, idc.get_func_name(ea) or original_name)))
-    results = []
-    emit("progress", "Renaming variables in %d original sub_* function(s)" % len(items), stage="variables", current=0, total=len(items))
-    worker = var_renamer.VarRenameWorker(cfg, items, is_retry=True)
-    worker.batch_done.connect(lambda batch: results.extend(batch))
-    worker.log.connect(lambda message, level: emit("log", message, level=level))
-    worker.update_status.connect(lambda message: emit("log", message) if message else None)
-    worker.run()
+        all_items.append((index, var_renamer.FuncData(ea, idc.get_func_name(ea) or original_name)))
 
     functions_changed = 0
     variables_renamed = 0
     failed = 0
-    for _index, func, suggestions in results:
-        if not suggestions:
-            continue
-        applied, rejected, details = var_renamer.apply_var_renames(
-            func.ea,
-            suggestions,
-            log_fn=lambda message, level="info": emit("log", message, level=level),
-        )
-        if applied:
-            functions_changed += 1
-        variables_renamed += applied
-        failed += rejected
+    cache_hits = 0
+    remaining_items = []
+
+    for index, func in all_items:
+        cached = False
+        if cache:
+            try:
+                cfunc = ida_hexrays.decompile(func.ea)
+                if cfunc:
+                    code = str(cfunc)
+                    lvars = [v.name for v in cfunc.get_lvars() if v.name]
+                    fp = fingerprint(code, lvar_names=lvars, own_name=func.name, user_functions=existing, image_range=image_range)
+                    res = cache.lookup_variables(fp)
+                    if res:
+                        mapping, kind = res
+                        name_map = {fp.var_order[idx]: name for idx, name in mapping.items() if idx < len(fp.var_order)}
+                        if name_map:
+                            applied, rejected, details = var_renamer.apply_var_renames(
+                                func.ea,
+                                name_map,
+                                log_fn=lambda message, level="info": emit("log", message, level=level),
+                            )
+                            if applied:
+                                functions_changed += 1
+                                variables_renamed += applied
+                                cache_hits += applied
+                                cached = True
+                                emit("log", "[cache %s] 0x%X: reused %d variable(s)" % (kind, func.ea, applied), level="ok")
+            except Exception:
+                pass
+        if not cached:
+            remaining_items.append((len(remaining_items), func))
+
+    if cache_hits:
+        emit("log", "Variable rename cache: reused %d variable(s)" % cache_hits, level="ok")
+
+    if tracker and not tracker.allowed(cfg.get("profile_name", "OpenAI"), cfg.get("url") or ""):
+        emit("log", "Token budget reached; skipping LLM variable renaming", level="warning")
+        remaining_items = []
+
+    if remaining_items:
+        results = []
         emit(
-            "log",
-            "0x%X: %d variable(s) renamed, %d rejected" % (func.ea, applied, rejected),
-            level="ok" if applied else "warning",
-            details=details,
+            "progress",
+            "Renaming variables in %d remaining function(s)" % len(remaining_items),
+            stage="variables",
+            current=0,
+            total=len(remaining_items),
         )
+        worker = var_renamer.VarRenameWorker(cfg, remaining_items, is_retry=True)
+        worker.batch_done.connect(lambda batch: results.extend(batch))
+        worker.log.connect(lambda message, level: emit("log", message, level=level))
+        worker.update_status.connect(lambda message: emit("log", message) if message else None)
+        worker.run()
+
+        for _index, func, suggestions in results:
+            if not suggestions:
+                continue
+            pre_rename_fp = None
+            if cache:
+                try:
+                    cfunc = ida_hexrays.decompile(func.ea)
+                    if cfunc:
+                        code = str(cfunc)
+                        lvars = [v.name for v in cfunc.get_lvars() if v.name]
+                        pre_rename_fp = fingerprint(code, lvar_names=lvars, own_name=func.name, user_functions=existing, image_range=image_range)
+                except Exception:
+                    pass
+            applied, rejected, details = var_renamer.apply_var_renames(
+                func.ea,
+                suggestions,
+                log_fn=lambda message, level="info": emit("log", message, level=level),
+            )
+            if applied:
+                functions_changed += 1
+            variables_renamed += applied
+            failed += rejected
+            emit(
+                "log",
+                "0x%X: %d variable(s) renamed, %d rejected" % (func.ea, applied, rejected),
+                level="ok" if applied else "warning",
+                details=details,
+            )
+            if cache and applied and pre_rename_fp:
+                try:
+                    canonical_map = {name: i for i, name in enumerate(pre_rename_fp.var_order)}
+                    to_store = {canonical_map[old]: new for old, new in suggestions.items() if old in canonical_map}
+                    if to_store:
+                        cache.store_variables(pre_rename_fp, to_store)
+                except Exception:
+                    pass
+
     return {
-        "candidates": len(items),
+        "candidates": len(all_items),
         "functions_changed": functions_changed,
         "variables_renamed": variables_renamed,
         "failed": failed,
+        "cache_hits": cache_hits,
     }
 
 
 def run_autonomous_investigation(job, cfg, renamer):
+    emit("stage", "Investigating sample", stage="investigation")
     import idaapi
     import idc
     import idautils
@@ -650,7 +789,7 @@ def run_autonomous_investigation(job, cfg, renamer):
         if turn == max_turns:
             prompt_blocks.append(
                 "\nCRITICAL: Maximum investigation turns reached (Turn %d/%d). "
-                "Do not request more tools. Return action=final with a comprehensive executive dossier report in Markdown."
+                "Do not request more tools. Return action=final with a comprehensive executive report in Markdown."
                 % (turn, max_turns)
             )
         else:
@@ -747,10 +886,10 @@ def run_autonomous_investigation(job, cfg, renamer):
 
     # If completed without final report, prompt for final synthesis
     if not final_report:
-        emit("progress", "Synthesizing executive investigation dossier...", stage="investigation", current=max_turns, total=max_turns)
+        emit("progress", "Synthesizing executive investigation report...", stage="investigation", current=max_turns, total=max_turns)
         synthesis_prompt = (
             "All investigation turns are complete. Based on all collected findings, observations, and evidence, "
-            "produce a detailed Markdown Executive Investigation Dossier. "
+            "produce a detailed Markdown Executive Investigation Report. "
             "Include:\n"
             "1. Executive Summary & Malware Triage\n"
             "2. Identified Capabilities & Behaviors\n"
@@ -773,11 +912,12 @@ def run_autonomous_investigation(job, cfg, renamer):
 
     output_root = Path(job["result_path"]).resolve().parent
     output_root.mkdir(parents=True, exist_ok=True)
+    report_md_path = output_root / "investigation_report.md"
     dossier_path = output_root / "investigation_dossier.md"
     findings_path = output_root / "investigation_findings.json"
 
     dossier_lines = [
-        "# Autonomous Agentic Investigation Dossier",
+        "# Autonomous Agent Investigation Report",
         "",
         "| Field | Value |",
         "|---|---|",
@@ -820,10 +960,11 @@ def run_autonomous_investigation(job, cfg, renamer):
     dossier_lines.append("")
 
     dossier_text = "\n".join(dossier_lines)
+    report_md_path.write_text(dossier_text, encoding="utf-8")
     dossier_path.write_text(dossier_text, encoding="utf-8")
     findings_path.write_text(session.to_json(), encoding="utf-8")
 
-    emit("log", "Investigation dossier saved to: %s" % dossier_path, level="ok")
+    emit("log", "Investigation report saved to: %s" % report_md_path, level="ok")
     emit("log", "Structured findings saved to: %s" % findings_path, level="ok")
 
     INVESTIGATION.update({
@@ -1072,53 +1213,184 @@ def run_report_generation(job, cfg, renamer, stats):
     return {"model_path": str(model_path), "synthesis_status": status}
 
 
+def _run_cli_agent_workspace(provider, executable, model, ws_path, prompt, timeout=300):
+    import shutil
+    import subprocess
+
+    ws = Path(ws_path).resolve()
+    args = []
+    if provider == "AntigravityCLI":
+        cmd = executable or shutil.which("agy") or "agy"
+        args = [cmd, "--dangerously-skip-permissions", "-p", prompt]
+        if model and str(model).lower() not in ("default", "auto", ""):
+            args.extend(["--model", str(model)])
+    elif provider == "ClaudeCode":
+        cmd = executable or shutil.which("claude") or "claude"
+        args = [cmd, "-p", prompt, "--dangerously-skip-permissions"]
+        if model and str(model).lower() not in ("default", "auto", ""):
+            args.extend(["--model", str(model)])
+    elif provider == "OpenCode":
+        cmd = executable or shutil.which("opencode") or "opencode"
+        args = [cmd, "run", prompt]
+        if model and str(model).lower() not in ("default", "auto", ""):
+            args.extend(["--model", str(model)])
+    elif provider == "CopilotCLI":
+        cmd = executable or shutil.which("copilot") or shutil.which("gh") or "copilot"
+        is_gh = Path(cmd).stem.lower() == "gh"
+        if is_gh:
+            args = [cmd, "copilot", "explain", prompt]
+        else:
+            args = [cmd, "-p", prompt, "-s"]
+            if model and str(model).lower() not in ("default", "auto", ""):
+                args.extend(["--model", str(model)])
+    else:
+        return None
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    proc = subprocess.run(
+        args,
+        cwd=str(ws),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        creationflags=creationflags,
+    )
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError("%s exited with code %s: %s" % (provider, proc.returncode, err))
+    return proc.stdout.strip() or proc.stderr.strip()
+
+
+def _build_workspace_context_prompt(ws, base_prompt):
+    """Collect key facts and triage code from the exported workspace into a comprehensive prompt."""
+    sections = [base_prompt, "\n\n=== EXPORTED WORKSPACE CONTEXT ==="]
+    agents_file = ws / "AGENTS.md"
+    if agents_file.is_file():
+        sections.append("\n## Sample Overview (AGENTS.md)\n" + agents_file.read_text(encoding="utf-8", errors="replace")[:2000])
+
+    triage_file = ws / "catalog" / "triage_indicators.json"
+    if triage_file.is_file():
+        sections.append("\n## Triage Indicators\n" + triage_file.read_text(encoding="utf-8", errors="replace")[:4000])
+
+    imports_file = ws / "catalog" / "imports.json"
+    if imports_file.is_file():
+        sections.append("\n## Key Imports\n" + imports_file.read_text(encoding="utf-8", errors="replace")[:3000])
+
+    strings_file = ws / "catalog" / "strings.json"
+    if strings_file.is_file():
+        sections.append("\n## Suspicious Strings\n" + strings_file.read_text(encoding="utf-8", errors="replace")[:3000])
+
+    try:
+        if triage_file.is_file():
+            tdata = json.loads(triage_file.read_text(encoding="utf-8", errors="replace"))
+            ranked = tdata.get("ranked_functions") or []
+            budget = 12000
+            for item in ranked[:5]:
+                mod = item.get("module") or ""
+                fn_name = item.get("name") or ""
+                clean_name = fn_name.lstrip("_")
+                for candidate in (
+                    ws / "modules" / mod / (clean_name + ".c"),
+                    ws / "modules" / mod / (fn_name + ".c"),
+                ):
+                    if candidate.is_file():
+                        content = candidate.read_text(encoding="utf-8", errors="replace")
+                        if len(content) > budget:
+                            content = content[:budget] + "\n/* ... truncated ... */"
+                        sections.append("\n## Decompiled Function: %s (%s)\n```c\n%s\n```" % (fn_name, item.get("address"), content))
+                        budget -= len(content)
+                        break
+                if budget <= 1000:
+                    break
+    except Exception:
+        pass
+
+    return "\n".join(sections)
+
+
 def run_workspace_analysis(job, cfg, renamer, workspace_path):
     """Analyze the exported AI workspace and write a technical malware analysis report using a CLI Agent."""
-    provider = job.get("provider") or ""
-    if provider not in CLI_PROVIDERS:
-        emit(
-            "log",
-            "Workspace analysis skipped: only available for CLI Agent providers (Claude Code, Antigravity CLI, OpenCode, GitHub Copilot) "
-            "to prevent excessive API token consumption.",
-            level="warning",
-        )
-        return None
-
-    emit("stage", "Analyzing exported AI workspace with %s" % provider, stage="workspace_analysis")
-    emit("log", "Invoking %s on exported workspace: %s" % (provider, workspace_path))
+    profile = job.get("profile") or {}
+    provider = str(profile.get("provider") or job.get("provider") or PROVIDER_INFO.get("active") or "").strip()
+    executable = str(profile.get("executable") or job.get("executable") or "").strip()
+    model = str(profile.get("model") or job.get("model") or "").strip()
     ws = Path(workspace_path)
 
+    emit("stage", "Analyzing exported AI workspace with %s" % (provider or "AI"), stage="workspace_analysis")
+    emit("log", "Invoking %s on exported workspace: %s" % (provider or "AI", workspace_path))
+
     system_prompt = (
-        "You are an experienced malware analyst and threat intelligence researcher "
-        "writing a technical malware analysis report for a cybersecurity audience."
+        "You are a senior malware analyst and threat intelligence researcher specializing in "
+        "reverse engineering and technical threat reporting."
     )
     prompt = (
-        "Analyze the exported IDA decompilation files in this workspace directory: %s\n\n"
-        "Start by reading AGENTS.md to understand the file structure. Then inspect the decompiled C files, "
-        "strings, and imports to proceed with the analysis.\n\n"
-        "Writing Style\n\n"
-        "- Write in a natural, professional, human-written tone, similar to malware research reports "
-        "published by Kaspersky GReAT, ESET Research, or Google Threat Intelligence Group.\n"
-        "- Use descriptive section headings followed by clear, connected paragraphs explaining the malware's behavior.\n"
-        "- Focus on explaining what the malware does, how it works, and why the behavior matters.\n"
-        "- Write for security researchers, threat intelligence analysts, incident responders, and technically knowledgeable readers.\n"
-        "- Keep explanations technically accurate but easy to follow.\n"
-        "- Prefer concise paragraphs over lengthy explanations.\n"
-        "- Explain complex mechanisms in straightforward language without oversimplifying important technical details.\n"
-        "- Maintain a neutral, factual, evidence-based tone.\n"
-        "- Include relevant decompiled code snippets when they help explain interesting, unusual, or technically significant malware behavior.\n\n"
-        "Write the structured technical malware analysis report now:"
+        "Analyze the exported IDA decompilation files and triage artifacts in this workspace directory: %s\n\n"
+        "Write a clear, concise, and professionally written technical threat intelligence report "
+        "based on the evidence in this workspace. The result should read like research written by an experienced "
+        "malware analyst, not AI-generated reverse engineering documentation.\n\n"
+        "## 1. Writing Style\n"
+        "- Write naturally using clear, connected paragraphs and a logical narrative.\n"
+        "- Use a professional, human writing style without robotic, academic, or overly formal language.\n"
+        "- Avoid repetitive sentence structures, generic AI phrases, unnecessary jargon, and filler.\n"
+        "- Remove excessive labels such as 'Confirmed' and 'Hypothesis'. Express uncertainty naturally when needed.\n"
+        "- Explain malware behaviour directly without overexplaining implementation details.\n"
+        "- Avoid exaggeration, unsupported speculation, and repetitive conclusions.\n"
+        "- Prioritize readability without sacrificing technical accuracy.\n\n"
+        "## 2. Technical Content\n"
+        "- Focus on what the malware does, how it operates, and why its behaviour matters.\n"
+        "- Explain relevant mechanisms without documenting every function, API parameter, variable, or memory address.\n"
+        "- Include technical details such as APIs, commands, file paths, and registry keys only when they contribute to understanding the malware.\n"
+        "- Exclude compiler-generated code, runtime initialization, and irrelevant implementation details.\n"
+        "- Preserve significant findings, unusual techniques, execution conditions, limitations, and implementation mistakes.\n"
+        "- Distinguish observed behaviour from intended behaviour. Never present attempted actions as successfully executed without evidence.\n"
+        "- Avoid function-by-function walkthroughs unless necessary to explain a complex mechanism.\n\n"
+        "## 3. Report Structure\n"
+        "- Do not follow a fixed report template or mandatory section headings.\n"
+        "- Determine the report structure based on the malware's actual capabilities, execution flow, and noteworthy findings.\n"
+        "- Use meaningful, descriptive headings that naturally fit the analysis.\n"
+        "- Combine related behaviours into coherent sections rather than creating unnecessary subsections.\n"
+        "- Do not force sections such as Persistence, C2, or Defense Evasion when unsupported or irrelevant.\n"
+        "- Use paragraphs as the primary format. Include lists, tables, or diagrams only when they improve clarity.\n"
+        "- Ensure the report reads as a cohesive research article rather than a checklist of malware capabilities.\n\n"
+        "## 4. Code Snippets\n"
+        "- Include short decompiled code snippets only when they illustrate interesting or significant mechanisms.\n"
+        "- Prioritize unusual execution methods, encryption, communication protocols, anti-analysis techniques, and implementation mistakes.\n"
+        "- Avoid dumping complete functions or including code that adds little analytical value.\n"
+        "- Briefly introduce each snippet and explain its significance.\n"
+        "- Preserve the original code's technical meaning without fabricating or silently altering behaviour.\n\n"
+        "## 5. Evidence and Accuracy\n"
+        "- Verify findings against available analysis artifacts, decompiled code, and disassembly.\n"
+        "- Preserve important technical evidence and indicators of compromise (IOCs).\n"
+        "- Clearly distinguish confirmed observations from assumptions or hypotheses.\n"
+        "- Do not infer capabilities or malicious intent from isolated APIs or strings.\n"
+        "- Avoid unsupported classifications, such as treating every HTTP request as C2 or ordinary delays as sandbox evasion.\n"
+        "- Retain useful source references without excessive inline citations.\n"
+        "- Remove unsupported claims rather than rewriting them as facts.\n\n"
+        "Write the publication-quality malware research report now in Markdown format:"
     ) % str(ws.resolve())
 
-    emit("progress", "Synthesizing malware analysis report via %s..." % provider, stage="workspace_analysis")
-    try:
-        report_text = renamer.ai_request(cfg, prompt, system_prompt, max_tokens=8000)
-    except Exception as exc:
-        emit("log", "CLI Agent workspace analysis failed: %s" % exc, level="error")
-        return None
+    report_text = None
+    if provider in CLI_PROVIDERS:
+        emit("progress", "Autonomous CLI Agent (%s) inspecting workspace..." % provider, stage="workspace_analysis")
+        try:
+            report_text = _run_cli_agent_workspace(provider, executable, model, ws, prompt, timeout=300)
+        except Exception as exc:
+            emit("log", "Autonomous CLI Agent invocation failed (%s); falling back to context synthesis" % exc, level="warning")
+            report_text = None
 
     if not report_text or not report_text.strip():
-        emit("log", "CLI Agent returned empty analysis report.", level="warning")
+        emit("progress", "Synthesizing malware analysis report from workspace context...", stage="workspace_analysis")
+        context_prompt = _build_workspace_context_prompt(ws, prompt)
+        try:
+            report_text = renamer.ai_request(cfg, context_prompt, system_prompt, max_tokens=8000)
+        except Exception as exc:
+            emit("log", "Workspace analysis synthesis failed: %s" % exc, level="error")
+            return None
+
+    if not report_text or not report_text.strip():
+        emit("log", "Workspace analysis returned empty report.", level="warning")
         return None
 
     out_file = ws / "malware_analysis_report.md"
@@ -1152,11 +1424,34 @@ def main():
     emit("stage", "Waiting for IDA auto-analysis", stage="ida")
     ida_auto.auto_wait()
     original_idb = save_original_idb(job)
+
+    tracker = None
+    try:
+        from omni_idb.usage import UsageTracker
+        tracker = UsageTracker(
+            budget_tokens=int(job.get("token_budget") or 0),
+            price_overrides=job.get("pricing"),
+        )
+        job["_tracker"] = tracker
+    except Exception as exc:
+        emit("log", "Could not initialize usage tracker: %s" % exc, level="warning")
+
+    cache = None
+    cache_path_str = job.get("cache_path")
+    if job.get("use_rename_cache", True) and cache_path_str:
+        try:
+            from omni_idb.rename_cache import RenameCache
+            cache = RenameCache(cache_path_str)
+        except Exception as exc:
+            emit("log", "Could not open rename cache (%s); proceeding without cache" % exc, level="warning")
+            cache = None
+
     cfg = configure_provider(job, CONFIG)
     install_provider_adapter(CONFIG, cfg, renamer, var_renamer, repo_root, job)
 
+    emit("stage", "Scanning functions", stage="scan")
     sub_functions = collect_sub_functions(renamer)
-    emit("stage", "Found %d sub_* function(s)" % len(sub_functions), stage="scan", total=len(sub_functions))
+    emit("progress", "Found %d sub_* function(s)" % len(sub_functions), stage="scan", total=len(sub_functions))
     result = {
         "sample": job.get("sample_path"),
         "idb_path": job.get("idb_path"),
@@ -1168,9 +1463,9 @@ def main():
     }
 
     if job.get("rename_functions"):
-        result["function_rename"] = run_function_rename(sub_functions, cfg, renamer)
+        result["function_rename"] = run_function_rename(sub_functions, cfg, renamer, cache=cache, tracker=tracker)
     if job.get("rename_variables"):
-        result["variable_rename"] = run_variable_rename(sub_functions, cfg, var_renamer)
+        result["variable_rename"] = run_variable_rename(sub_functions, cfg, var_renamer, cache=cache, tracker=tracker)
     if job.get("autonomous_investigation"):
         result["autonomous_investigation"] = run_autonomous_investigation(job, cfg, renamer)
     if job.get("autonomous_investigation") and job.get("report_dir"):
@@ -1185,17 +1480,50 @@ def main():
             result["report"] = {"error": str(exc)}
 
     if job.get("generate_workspace"):
-        exporter_module = load_repository_module(repo_root, "ai_workspace_export")
-        export_ai_workspace = exporter_module.export_ai_workspace
         workspace_path = str(Path(job["workspace_path"]).resolve())
         emit("stage", "Exporting AI workspace", stage="workspace")
-        export_result = run_workspace_export(export_ai_workspace, workspace_path)
-        result["workspace_path"] = export_result["path"]
-        result["workspace_counts"] = export_result["counts"]
+        original_names_map = {int(item["address"], 16): item["old"] for item in RENAMED if item.get("address") and item.get("old")}
+        try:
+            from omni_idb.workspace_export import export_workspace
+            export_result = export_workspace(
+                workspace_path,
+                progress_callback=lambda label, current, total: emit(
+                    "progress", label, stage="workspace", current=current, total=total
+                ),
+                original_names=original_names_map,
+            )
+            result["workspace_path"] = export_result["path"]
+            result["workspace_counts"] = export_result["counts"]
+        except Exception as exc:
+            emit("log", "Modern workspace export fallback (%s); using legacy exporter" % exc, level="warning")
+            exporter_module = load_repository_module(repo_root, "ai_workspace_export")
+            export_ai_workspace = exporter_module.export_ai_workspace
+            export_result = run_workspace_export(export_ai_workspace, workspace_path)
+            result["workspace_path"] = export_result["path"]
+            result["workspace_counts"] = export_result["counts"]
         if job.get("analyze_workspace"):
             report_path = run_workspace_analysis(job, cfg, renamer, workspace_path)
             if report_path:
                 result["workspace_analysis_report"] = report_path
+
+    if tracker:
+        result["usage"] = tracker.snapshot()
+        try:
+            from omni_idb.usage import describe_usage
+            emit("log", describe_usage(result["usage"]), level="info")
+        except Exception:
+            pass
+    if cache:
+        try:
+            result["cache"] = cache.stats()
+            cache.close()
+            emit("log", "Rename cache: %d functions, %d variables, %d total hits" % (
+                result["cache"]["function_entries"],
+                result["cache"]["variable_entries"],
+                result["cache"]["total_hits"],
+            ), level="info")
+        except Exception:
+            pass
 
     idb_path = str(Path(job["idb_path"]).resolve())
     Path(idb_path).parent.mkdir(parents=True, exist_ok=True)

@@ -25,6 +25,7 @@ from .config import (
     KEYLESS_PROVIDERS,
     PROVIDERS,
     AppSettings,
+    cache_path,
     default_models_for_provider,
     detect_engine_root,
     detect_ida,
@@ -35,7 +36,7 @@ from .config import (
     runner_script,
 )
 from .discovery import Sample, discover, format_size
-from .runner import GenesectEvent, RunnerEvent, RunRequest
+from .runner import OmniEvent, GenesectEvent, RunnerEvent, RunRequest
 
 # ---------------------------------------------------------------- palette
 # Dark modern slate-navy aesthetic matching the designer UI
@@ -79,7 +80,52 @@ MAX_LOGS = 4000
 MAX_IDA_LOGS = 10000
 
 # ---------------------------------------------------------------- typography
-# Full application typography unified with JetBrains Mono
+def load_custom_font() -> bool:
+    """Load local JetBrains Mono TTF font dynamically into Windows GDI session."""
+    if sys.platform != "win32":
+        return False
+    search_dirs = [
+        project_root(),
+        Path.cwd(),
+        Path(sys.executable).resolve().parent,
+        Path(__file__).resolve().parent.parent,
+    ]
+    seen = set()
+    loaded_any = False
+    for d in search_dirs:
+        try:
+            d = d.resolve()
+            if d in seen or not d.is_dir():
+                continue
+            seen.add(d)
+            for ttf in d.glob("*[Jj]et[Bb]rains*.ttf"):
+                import ctypes
+                FR_PRIVATE = 0x10
+                res = ctypes.windll.gdi32.AddFontResourceExW(str(ttf.resolve()), FR_PRIVATE, 0)
+                if res > 0:
+                    loaded_any = True
+        except Exception:
+            pass
+    return loaded_any
+
+
+_FONT_LOADED = load_custom_font()
+
+
+def _detect_font_family(root: Optional[tk.Tk] = None) -> str:
+    """Select the best available monospace font, prioritizing JetBrains Mono."""
+    load_custom_font()
+    try:
+        import tkinter.font as tkfont
+        available = set(tkfont.families(root))
+        for cand in ("JetBrains Mono", "Cascadia Code", "Cascadia Mono", "Consolas", "Courier New"):
+            if cand in available:
+                return cand
+    except Exception:
+        pass
+    return "JetBrains Mono"
+
+
 FONT_FAMILY = "JetBrains Mono"
 
 MONO = (FONT_FAMILY, 9)
@@ -154,6 +200,53 @@ def create_check_icons() -> tuple[tk.PhotoImage, tk.PhotoImage]:
     return img_un, img_ck
 
 
+def create_radio_icons() -> tuple[tk.PhotoImage, tk.PhotoImage]:
+    """Render sleek circular radio button icons with crisp dot and generous gap to caption."""
+    BOX_W = 14
+    BOX_H = 14
+    GAP = 8
+    TOTAL_W = BOX_W + GAP
+
+    img_un = tk.PhotoImage(width=TOTAL_W, height=BOX_H)
+    img_ck = tk.PhotoImage(width=TOTAL_W, height=BOX_H)
+
+    pixels_un = []
+    pixels_ck = []
+
+    cx, cy = 6.5, 6.5
+    r_outer_sq = 6.0**2
+    r_inner_sq = 4.8**2
+    r_dot_sq = 2.6**2
+
+    for y in range(BOX_H):
+        row_un = []
+        row_ck = []
+        for x in range(TOTAL_W):
+            if x >= BOX_W:
+                row_un.append(CARD)
+                row_ck.append(CARD)
+                continue
+            d_sq = (x - cx) ** 2 + (y - cy) ** 2
+            if d_sq > r_outer_sq:
+                row_un.append(CARD)
+                row_ck.append(CARD)
+            elif d_sq >= r_inner_sq:
+                row_un.append(BTN_BORDER)
+                row_ck.append("#3B82F6")
+            else:
+                row_un.append(INPUT_BG)
+                if d_sq <= r_dot_sq:
+                    row_ck.append("#38BDF8")
+                else:
+                    row_ck.append(INPUT_BG)
+        pixels_un.append(row_un)
+        pixels_ck.append(row_ck)
+
+    img_un.put(pixels_un, to=(0, 0, TOTAL_W, BOX_H))
+    img_ck.put(pixels_ck, to=(0, 0, TOTAL_W, BOX_H))
+    return img_un, img_ck
+
+
 # ---------------------------------------------------------------- rounded button
 class RoundedButton(tk.Canvas):
     """Button with curved edge corners, anti-aliased splines, and smooth interactive states."""
@@ -171,13 +264,13 @@ class RoundedButton(tk.Canvas):
         hover_fill: str = BTN_HOVER,
         outline: str = BTN_BORDER,
         text_color: str = FG,
-        font: tuple = BUTTON_FONT,
+        font: Optional[tuple] = None,
         state: str = "normal",
         width: Optional[int] = None,
         height: Optional[int] = None,
     ):
-        self.btn_font = font
-        font_obj = tkfont.Font(font=font)
+        self.btn_font = font or BUTTON_FONT
+        font_obj = tkfont.Font(font=self.btn_font)
         self.width = width or (font_obj.measure(text) + padx * 2)
         self.height = height or (font_obj.metrics("linespace") + pady * 2)
         super().__init__(
@@ -369,34 +462,50 @@ def ida_color(line: str) -> str:
 class QueueView(tk.Frame):
     """Sample table with status badges and an aesthetic empty state."""
 
-    def __init__(self, master, compact: bool):
+    def __init__(self, master, compact: bool = False, on_open_output: Optional[Callable[[str], None]] = None):
         super().__init__(master, bg=CONSOLE_BG)
         self.compact = compact
+        self.on_open_output = on_open_output
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
         cols = (
-            ("n", "name", "stage", "status", "time_spent")
+            ("n", "name", "status", "time_spent")
             if compact
-            else ("n", "name", "stage", "status", "time_spent", "type", "size")
+            else ("n", "name", "status", "time_spent", "type", "size")
         )
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse", style="Omni.Treeview")
         heads = {
-            "n": ("#", 38),
-            "name": ("Sample Name", 200 if compact else 280),
-            "stage": ("Current Stage", 180 if compact else 230),
-            "status": ("Status", 95 if compact else 110),
-            "time_spent": ("Time Spent", 85 if compact else 100),
-            "type": ("Type", 110),
-            "size": ("Size", 85),
+            "n": ("#", 42, 36),
+            "name": ("Sample Name", 340, 180),
+            "status": ("Status", 220, 140),
+            "time_spent": ("Time Spent", 110, 80),
+            "type": ("Type", 115, 80),
+            "size": ("Size", 90, 70),
         }
         for col in cols:
-            title, width = heads[col]
+            title, width, minw = heads[col]
             self.tree.heading(col, text=title)
-            self.tree.column(col, width=width, anchor="w", stretch=(col in ("name", "stage")))
+            self.tree.column(col, width=width, minwidth=minw, anchor="w", stretch=False)
         for tag, (bg, fg) in {"done": STATUS_COLORS["Complete"], "fail": STATUS_COLORS["Failed"], "run": RUNNING_COLORS}.items():
             self.tree.tag_configure(tag, background=bg, foreground=fg)
-        scroll = ttk.Scrollbar(self, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.tree.pack(side="left", fill="both", expand=True)
+
+        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview, style="Vertical.TScrollbar")
+        xscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview, style="Horizontal.TScrollbar")
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+
+        # Double-click and Enter key binding to open sample output folder
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Return>", self._on_double_click)
+
+        # Right-click context menu
+        self.context_menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=BLUE, activeforeground="#FFFFFF", font=UI_FONT)
+        self.context_menu.add_command(label="Open Output Folder", command=self._open_selected_folder)
+        self.tree.bind("<Button-3>", self._on_right_click)
 
         # Empty state canvas & label
         self.empty_frame = tk.Frame(self, bg=CONSOLE_BG)
@@ -412,6 +521,29 @@ class QueueView(tk.Frame):
             justify="center",
         )
         self.empty_label.pack()
+
+    def _on_double_click(self, event=None) -> None:
+        if event and hasattr(event, "y"):
+            region = self.tree.identify_region(event.x, event.y)
+            if region not in ("cell", "tree"):
+                return
+            row_id = self.tree.identify_row(event.y)
+        else:
+            sel = self.tree.selection()
+            row_id = sel[0] if sel else None
+        if row_id and self.on_open_output:
+            self.on_open_output(row_id)
+
+    def _on_right_click(self, event) -> None:
+        row_id = self.tree.identify_row(event.y)
+        if row_id:
+            self.tree.selection_set(row_id)
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def _open_selected_folder(self) -> None:
+        sel = self.tree.selection()
+        if sel and self.on_open_output:
+            self.on_open_output(sel[0])
 
     @staticmethod
     def _draw_empty_icon(canvas: tk.Canvas) -> None:
@@ -431,16 +563,73 @@ class QueueView(tk.Frame):
         self.empty_frame.place_forget()
         for index, sample in rows:
             tag = "done" if sample.is_complete() else "fail" if sample.is_failed() else "run" if sample.is_running() else ""
+            display_status = (
+                sample.stage
+                if sample.is_running() and sample.stage and sample.stage != "-"
+                else sample.status
+            )
             values = [
                 index + 1,
                 sample.path.name or str(sample.path),
-                sample.stage or "-",
-                sample.status,
+                display_status,
                 sample.time_spent(),
             ]
             if not self.compact:
                 values += [sample.kind.label, format_size(sample.size)]
             self.tree.insert("", "end", iid=str(index), values=values, tags=(tag,))
+
+
+class ScrollableColumn(tk.Frame):
+    """Vertical scrollable column for configuration cards with mousewheel support."""
+
+    def __init__(self, parent, bg: str = BG, **kwargs):
+        super().__init__(parent, bg=bg, **kwargs)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = tk.Frame(self.canvas, bg=bg)
+
+        self._window_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self._on_scroll)
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+
+    def _on_inner_configure(self, event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._update_scrollbar()
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self._window_id, width=event.width)
+        self._update_scrollbar()
+
+    def _update_scrollbar(self):
+        bbox = self.canvas.bbox("all")
+        if bbox and (bbox[3] - bbox[1]) > (self.canvas.winfo_height() + 4) and self.canvas.winfo_height() > 50:
+            if not self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack(side="right", fill="y")
+        else:
+            if self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack_forget()
+
+    def _on_scroll(self, *args):
+        self.scrollbar.set(*args)
+
+    def _on_mousewheel(self, event):
+        try:
+            x, y = self.winfo_pointerxy()
+            wx = self.winfo_rootx()
+            wy = self.winfo_rooty()
+            ww = self.winfo_width()
+            wh = self.winfo_height()
+            if wx <= x <= wx + ww and wy <= y <= wy + wh:
+                bbox = self.canvas.bbox("all")
+                if bbox and (bbox[3] - bbox[1]) > self.canvas.winfo_height():
+                    self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except Exception:
+            pass
 
 
 def card(master, **grid) -> tk.Frame:
@@ -465,14 +654,42 @@ def card_header(parent: tk.Frame, icon_char: str, title: str, subtitle: str) -> 
 
 
 def apply_theme(root: tk.Tk) -> None:
+    global FONT_FAMILY, MONO, UI_FONT, UI_FONT_BOLD, TITLE_FONT, SUB_FONT, HEADER_TITLE_FONT, BUTTON_FONT, SMALL_BTN_FONT, BADGE_FONT, CARD_ICON_FONT
+    FONT_FAMILY = _detect_font_family(root)
+    MONO = (FONT_FAMILY, 9)
+    UI_FONT = (FONT_FAMILY, 9)
+    UI_FONT_BOLD = (FONT_FAMILY, 9, "bold")
+    TITLE_FONT = (FONT_FAMILY, 10, "bold")
+    SUB_FONT = (FONT_FAMILY, 8)
+    HEADER_TITLE_FONT = (FONT_FAMILY, 15, "bold")
+    BUTTON_FONT = (FONT_FAMILY, 9, "bold")
+    SMALL_BTN_FONT = (FONT_FAMILY, 8, "bold")
+    BADGE_FONT = (FONT_FAMILY, 8, "bold")
+    CARD_ICON_FONT = (FONT_FAMILY, 16)
+
+    # Configure Tk core named fonts so all native & ttk elements use JetBrains Mono
+    try:
+        import tkinter.font as tkfont
+        for name in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont"):
+            tkfont.nametofont(name).configure(family=FONT_FAMILY, size=9)
+        tkfont.nametofont("TkHeadingFont").configure(family=FONT_FAMILY, size=10, weight="bold")
+        tkfont.nametofont("TkCaptionFont").configure(family=FONT_FAMILY, size=8)
+        tkfont.nametofont("TkSmallCaptionFont").configure(family=FONT_FAMILY, size=8)
+    except Exception:
+        pass
+
     style = ttk.Style(root)
     style.theme_use("clam")
     root.configure(bg=BG)
 
-    # Setup authentic compact 13x13 checkmark icons
+    # Setup authentic compact 13x13 checkmark and radio icons
     un_img, ck_img = create_check_icons()
     root._check_un_img = un_img
     root._check_ck_img = ck_img
+
+    run_img, rck_img = create_radio_icons()
+    root._radio_un_img = run_img
+    root._radio_ck_img = rck_img
 
     style.element_create("Checkmark.indicator", "image", ck_img, ("!selected", un_img))
     style.layout(
@@ -498,12 +715,42 @@ def apply_theme(root: tk.Tk) -> None:
         ],
     )
 
+    style.element_create("Radioindicator.image", "image", rck_img, ("!selected", run_img))
+    style.layout(
+        "TRadiobutton",
+        [
+            (
+                "Radiobutton.padding",
+                {
+                    "sticky": "nswe",
+                    "children": [
+                        ("Radioindicator.image", {"side": "left", "sticky": ""}),
+                        (
+                            "Radiobutton.focus",
+                            {
+                                "side": "left",
+                                "sticky": "w",
+                                "children": [("Radiobutton.label", {"sticky": "nswe"})],
+                            },
+                        ),
+                    ],
+                },
+            )
+        ],
+    )
+
     # General widget styling with JetBrains Mono
     style.configure(".", background=CARD, foreground=FG, fieldbackground=INPUT_BG, font=UI_FONT, bordercolor=CARD_BORDER)
     style.configure("TFrame", background=CARD)
     style.configure("TLabel", background=CARD, foreground=FG, font=UI_FONT)
     style.configure("TCheckbutton", background=CARD, foreground=FG, font=UI_FONT, focuscolor=CARD, padding=(0, 1))
     style.map("TCheckbutton", background=[("active", CARD)], foreground=[("active", "#FFFFFF")])
+    style.configure("TRadiobutton", background=CARD, foreground=FG, font=UI_FONT, focuscolor=CARD, padding=(0, 1))
+    style.map(
+        "TRadiobutton",
+        background=[("active", CARD)],
+        foreground=[("disabled", "#64748B"), ("active", "#FFFFFF")],
+    )
 
     # Inputs with dark inset background and crisp borders
     style.configure("TEntry", fieldbackground=INPUT_BG, foreground=FG, insertcolor=FG, bordercolor=INPUT_BORDER, font=UI_FONT, padding=(8, 4))
@@ -514,6 +761,7 @@ def apply_theme(root: tk.Tk) -> None:
     # Progress bar and Scrollbar
     style.configure("Horizontal.TProgressbar", troughcolor=BG, background=BLUE, bordercolor=CARD_BORDER, thickness=6)
     style.configure("Vertical.TScrollbar", background=BTN_BG, troughcolor=CONSOLE_BG, arrowcolor=MUTED, bordercolor=CONSOLE_BG)
+    style.configure("Horizontal.TScrollbar", background=BTN_BG, troughcolor=CONSOLE_BG, arrowcolor=MUTED, bordercolor=CONSOLE_BG)
 
     # Treeview (Sample queue) with JetBrains Mono
     style.configure("Omni.Treeview", background=CONSOLE_BG, fieldbackground=CONSOLE_BG, foreground=FG, font=UI_FONT, rowheight=24, borderwidth=0)
@@ -529,13 +777,13 @@ def apply_theme(root: tk.Tk) -> None:
 
 # ---------------------------------------------------------------- app
 class OmniApp:
-    TABS = ("Queue", "Log", "IdaLog", "Split")
+    TABS = ("Queue", "Log", "IdaLog")
 
     def __init__(self, root: tk.Tk, initial_path: Optional[str] = None):
         self.root = root
         root.title("OmniIDB — Autonomous Bulk AI Reverse Engineering & IDB Enrichment for IDA Pro")
-        root.geometry("1200x900")
-        root.minsize(980, 740)
+        root.geometry("1260x880")
+        root.minsize(1020, 680)
         try:
             root.state("zoomed")
         except Exception:
@@ -631,15 +879,18 @@ class OmniApp:
         self.v_fallback_exe = tk.StringVar(value=s.fallback_executable)
         self.v_rename_fn = tk.BooleanVar(value=s.rename_functions)
         self.v_rename_var = tk.BooleanVar(value=s.rename_variables)
-        self.v_workspace = tk.BooleanVar(value=False)
-        self.v_analyze_workspace = tk.BooleanVar(value=s.analyze_workspace)
-        # By default uncheck Autonomous Agentic Investigation
+        self.v_workspace = tk.BooleanVar(value=s.generate_workspace)
+        # By default make AI investigation and reporting "None"
+        self.v_report_mode = tk.StringVar(value="none")
         self.v_agent = tk.BooleanVar(value=False)
+        self.v_analyze_workspace = tk.BooleanVar(value=False)
         self.v_turns = tk.IntVar(value=s.investigation_turns)
         self.v_recursive = tk.BooleanVar(value=s.recursive)
         self.v_shellcode = tk.BooleanVar(value=s.allow_shellcode)
         self.v_arch = tk.StringVar(value=s.shellcode_arch)
         self.v_batch = tk.IntVar(value=s.batch_size)
+        self.v_cache = tk.BooleanVar(value=s.use_rename_cache)
+        self.v_token_budget = tk.IntVar(value=s.token_budget)
         self.v_filter = tk.StringVar()
         self.v_status_filter = tk.StringVar(value="All")
         self.v_queued = tk.StringVar(value="0 sample(s) queued")
@@ -665,33 +916,36 @@ class OmniApp:
         s.fallback_executable = self.v_fallback_exe.get()
         s.rename_functions = self.v_rename_fn.get()
         s.rename_variables = self.v_rename_var.get()
+        s.use_rename_cache = self.v_cache.get()
         s.generate_workspace = self.v_workspace.get()
+        mode = self.v_report_mode.get()
+        s.autonomous_investigation = (mode == "investigate")
         s.analyze_workspace = (
-            self.v_analyze_workspace.get()
-            if self.v_workspace.get() and is_cli_provider(self.v_provider.get())
-            else False
+            mode == "workspace_analysis"
+            and self.v_workspace.get()
+            and is_cli_provider(self.v_provider.get())
         )
-        s.autonomous_investigation = self.v_agent.get()
         s.recursive = self.v_recursive.get()
         s.allow_shellcode = self.v_shellcode.get()
         s.shellcode_arch = self.v_arch.get()
         try:
             s.investigation_turns = max(3, min(30, int(self.v_turns.get())))
             s.batch_size = max(1, min(50, int(self.v_batch.get())))
+            s.token_budget = max(0, int(self.v_token_budget.get()))
         except (tk.TclError, ValueError):
             pass
 
     # ------------------------------------------------------------ UI build
     def _build_ui(self) -> None:
         root = self.root
-        outer = tk.Frame(root, bg=BG, padx=16, pady=12)
+        outer = tk.Frame(root, bg=BG, padx=14, pady=10)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(5, weight=1)
+        outer.rowconfigure(2, weight=1)
 
         # 1. Top Header Bar (Clean, JetBrains Mono, no logo, no settings/help)
         header = tk.Frame(outer, bg=BG)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
         title_box = tk.Frame(header, bg=BG)
         title_box.pack(anchor="w")
@@ -710,8 +964,8 @@ class OmniApp:
             bg=BG, fg=DIM, font=SUB_FONT,
         ).pack(anchor="w", pady=(2, 0))
 
-        # 2. Target Sample / Directory Card
-        target = card(outer, row=1, column=0, sticky="ew", pady=(0, 10))
+        # 2. Target Sample / Directory Card (Full width at top)
+        target = card(outer, row=1, column=0, sticky="ew", pady=(0, 8))
         target.columnconfigure(0, weight=1)
         card_header(target, "📁", "Target Sample / Directory", "Select a binary sample or directory to analyze")
 
@@ -741,95 +995,20 @@ class OmniApp:
         )
         self.arch_box.pack(side="left")
 
-        # 3. Middle Section: 2 Columns (Analysis Operations | AI Engine Configuration)
-        mid = tk.Frame(outer, bg=BG)
-        mid.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
-        mid.columnconfigure((0, 1), weight=1, uniform="mid")
+        # 3. Main Body Split Pane: Left = Configurations, Right = Run Bar + Long Queue/Log Table
+        body_pane = tk.Frame(outer, bg=BG)
+        body_pane.grid(row=2, column=0, sticky="nsew", pady=(0, 0))
+        body_pane.columnconfigure((0, 1), weight=1, uniform="body_pane")
+        body_pane.rowconfigure(0, weight=1)
 
-        # Left Column: Analysis Operations Card
-        ops_card = card(mid, row=0, column=0, sticky="nsew", padx=(0, 5))
-        ops_top = card_header(ops_card, "⚙", "Analysis Operations", "Select the analysis tasks to perform")
+        # ------------------------------------------------ Left Settings Column
+        left_col = ScrollableColumn(body_pane)
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left_inner = left_col.inner
 
-        # Curved Edge Select All button
-        self.select_all_btn = RoundedButton(
-            ops_top, "Select All", command=self.toggle_select_all_ops,
-            bg_color=CARD, font=SMALL_BTN_FONT, padx=8, pady=2, radius=6,
-        )
-        self.select_all_btn.place(relx=1.0, rely=0.2, anchor="ne")
-
-        ops_list = tk.Frame(ops_card, bg=CARD)
-        ops_list.pack(fill="x", pady=(2, 6))
-
-        def add_op(text: str, var: tk.BooleanVar, help_text: str, cmd=None) -> tk.Frame:
-            row = tk.Frame(ops_list, bg=CARD)
-            row.pack(fill="x", pady=2)
-            chk = ttk.Checkbutton(row, text=text, variable=var, command=cmd)
-            chk.pack(side="left")
-            make_help_badge(row, help_text).pack(side="left", padx=6)
-            return row
-
-        add_op(
-            "Rename sub_* functions (semantic naming)", self.v_rename_fn,
-            "Runs dependency-aware bottom-up bulk function renamer across unnamed subroutines.",
-        )
-        add_op(
-            "Rename local variables & parameters", self.v_rename_var,
-            "Runs Hex-Rays local variable renamer on decompiled functions.",
-        )
-        self.ws_row = add_op(
-            "Export OmniIDB AI workspace & context pack", self.v_workspace,
-            "Produces offline AI workspace (decompiled code, disassembly, call graphs, strings, imports).",
-            self._workspace_toggled,
-        )
-
-        # Sub-option: Proceed analysis of the Exported AI workspace (nested beneath Export AI workspace)
-        self.analyze_ws_row = tk.Frame(ops_list, bg=CARD)
-        self.chk_analyze_ws = ttk.Checkbutton(
-            self.analyze_ws_row,
-            text="Proceed analysis of the Exported AI workspace",
-            variable=self.v_analyze_workspace,
-        )
-        self.chk_analyze_ws.pack(side="left", padx=(20, 0))
-        self.analyze_ws_badge = make_help_badge(
-            self.analyze_ws_row,
-            "Instructs the autonomous CLI agent to inspect the exported workspace and generate a structured malware analysis report.",
-        )
-        self.analyze_ws_badge.pack(side="left", padx=6)
-        if self.v_workspace.get():
-            self.analyze_ws_row.pack(fill="x", pady=(1, 3))
-
-        add_op(
-            "Autonomous Agentic Investigation (multi-turn AI analysis)", self.v_agent,
-            "Runs multi-turn goal-driven AI investigation and generates REAI Markdown, HTML, and vector PDF reports.",
-            self._agent_toggled,
-        )
-
-        # Turns row for investigation
-        self.turns_row = tk.Frame(ops_list, bg=CARD)
-        tk.Label(self.turns_row, text="Investigation Turns:", bg=CARD, fg=MUTED, font=SUB_FONT).pack(side="left", padx=(20, 6))
-        ttk.Spinbox(self.turns_row, from_=3, to=30, textvariable=self.v_turns, width=5).pack(side="left")
-        tk.Label(self.turns_row, text="(3 to 30 turns)", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left", padx=6)
-        if self.v_agent.get():
-            self.turns_row.pack(fill="x", pady=(2, 4))
-
-        # Output Directory Sub-section
-        ttk.Separator(ops_card).pack(fill="x", pady=(6, 8))
-        out_hdr = tk.Frame(ops_card, bg=CARD)
-        out_hdr.pack(fill="x", pady=(0, 4))
-        tk.Label(out_hdr, text="📁", bg=CARD, fg=SKY, font=CARD_ICON_FONT).pack(side="left", padx=(0, 10))
-        out_text = tk.Frame(out_hdr, bg=CARD)
-        out_text.pack(side="left", fill="x", expand=True)
-        tk.Label(out_text, text="Output Directory", bg=CARD, fg=FG, font=TITLE_FONT).pack(anchor="w")
-        tk.Label(out_text, text="Directory to store the analysis results", bg=CARD, fg=DIM, font=SUB_FONT).pack(anchor="w")
-
-        orow = tk.Frame(ops_card, bg=CARD)
-        orow.pack(fill="x", pady=(4, 0))
-        orow.columnconfigure(0, weight=1)
-        ttk.Entry(orow, textvariable=self.v_output).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        RoundedButton(orow, "📁 Browse...", command=lambda: self._pick_dir(self.v_output), bg_color=CARD, radius=6, padx=10, pady=4).grid(row=0, column=1)
-
-        # Right Column: AI Engine Configuration Card
-        ai_card = card(mid, row=0, column=1, sticky="nsew", padx=(5, 0))
+        # Card A: AI Engine Configuration
+        ai_card = card(left_inner)
+        ai_card.pack(fill="x", pady=(0, 10))
         card_header(ai_card, "🤖", "AI Engine Configuration", "Configure the AI provider and authentication")
 
         grid = tk.Frame(ai_card, bg=CARD)
@@ -844,7 +1023,6 @@ class OmniApp:
 
         add_row("provider", "Provider:", lambda p: ttk.Combobox(p, textvariable=self.v_provider, values=PROVIDERS, state="readonly", width=22))
 
-        # CLI row with curved Browse button
         def make_cli_box(p):
             f = tk.Frame(p, bg=CARD)
             f.columnconfigure(0, weight=1)
@@ -903,7 +1081,6 @@ class OmniApp:
         self.trow.pack(fill="x")
         self.trow.columnconfigure(1, weight=1)
 
-        # Curved Edge Main Test Connection Button
         self.test_btn = RoundedButton(
             self.trow, "⚡  Test Connection", command=lambda: self.start_test_connection("main"),
             fill=BLUE, hover_fill=BLUE_HOVER, outline="#3B82F6", text_color="#FFFFFF",
@@ -911,14 +1088,12 @@ class OmniApp:
         )
         self.test_btn.grid(row=0, column=0, sticky="w")
 
-        # Curved Edge Fallback Test Connection Button (conditionally visible when fallback checked)
         self.test_fb_btn = RoundedButton(
             self.trow, "⚡  Test Fallback", command=lambda: self.start_test_connection("fallback"),
             fill="#4F46E5", hover_fill="#4338CA", outline="#6366F1", text_color="#FFFFFF",
             font=BUTTON_FONT, padx=12, pady=4, radius=6, bg_color=CARD,
         )
 
-        # Pill badge for connection test outcome
         self.test_badge = tk.Frame(self.trow, bg=CARD, highlightthickness=0)
         self.test_badge.grid(row=0, column=1, sticky="ew", padx=(10, 0))
         self.test_badge_lbl = tk.Label(
@@ -926,10 +1101,130 @@ class OmniApp:
         )
         self.test_badge_lbl.pack(fill="x")
 
-        # 4. IDA Pro & Environment Configuration Card
-        ida_card = card(outer, row=3, column=0, sticky="ew", pady=(0, 10))
-        ida_card.columnconfigure(1, weight=1)
-        card_header(ida_card, "🖥", "IDA Pro & Environment Configuration", "Configure IDA Pro executable and analysis engine settings")
+        # Card B: Analysis Operations
+        ops_card = card(left_inner)
+        ops_card.pack(fill="x", pady=(0, 10))
+        ops_top = card_header(ops_card, "⚙", "Analysis Operations", "Select the analysis tasks to perform")
+
+        self.select_all_btn = RoundedButton(
+            ops_top, "Select All", command=self.toggle_select_all_ops,
+            bg_color=CARD, font=SMALL_BTN_FONT, padx=8, pady=2, radius=6,
+        )
+        self.select_all_btn.place(relx=1.0, rely=0.2, anchor="ne")
+
+        ops_list = tk.Frame(ops_card, bg=CARD)
+        ops_list.pack(fill="x", pady=(2, 6))
+
+        def add_op(text: str, var: tk.BooleanVar, help_text: str, cmd=None) -> tk.Frame:
+            row = tk.Frame(ops_list, bg=CARD)
+            row.pack(fill="x", pady=2)
+            chk = ttk.Checkbutton(row, text=text, variable=var, command=cmd)
+            chk.pack(side="left")
+            make_help_badge(row, help_text).pack(side="left", padx=6)
+            return row
+
+        add_op(
+            "Rename sub_* functions (semantic naming)", self.v_rename_fn,
+            "Runs dependency-aware bottom-up bulk function renamer across unnamed subroutines.",
+        )
+        add_op(
+            "Rename local variables & parameters", self.v_rename_var,
+            "Runs Hex-Rays local variable renamer on decompiled functions.",
+        )
+        self.ws_row = add_op(
+            "Export OmniIDB AI workspace & context pack", self.v_workspace,
+            "Produces offline AI workspace (decompiled code, disassembly, call graphs, strings, imports).",
+            self._workspace_toggled,
+        )
+
+        # AI Investigation & Reporting (Mutually exclusive reporting workflow)
+        ttk.Separator(ops_card).pack(fill="x", pady=(6, 8))
+
+        rep_hdr = tk.Frame(ops_card, bg=CARD)
+        rep_hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(rep_hdr, text="🔍", bg=CARD, fg=SKY, font=CARD_ICON_FONT).pack(side="left", padx=(0, 10))
+        rep_text = tk.Frame(rep_hdr, bg=CARD)
+        rep_text.pack(side="left", fill="x", expand=True)
+        tk.Label(rep_text, text="AI Investigation & Reporting", bg=CARD, fg=FG, font=TITLE_FONT).pack(anchor="w")
+        tk.Label(rep_text, text="Select at most one deep-dive AI reporting workflow", bg=CARD, fg=DIM, font=SUB_FONT).pack(anchor="w")
+
+        rep_list = tk.Frame(ops_card, bg=CARD)
+        rep_list.pack(fill="x", pady=(2, 4))
+
+        # 1. None
+        r_none = tk.Frame(rep_list, bg=CARD)
+        r_none.pack(fill="x", pady=2)
+        ttk.Radiobutton(
+            r_none,
+            text="None (renaming & workspace export only, fastest)",
+            variable=self.v_report_mode,
+            value="none",
+            command=self._report_mode_changed,
+        ).pack(side="left")
+        make_help_badge(
+            r_none,
+            "Fastest execution. Enriches the IDA database and exports context packs without generating an AI analysis report.",
+        ).pack(side="left", padx=6)
+
+        # 2. In-Database Agent Analysis
+        r_agent = tk.Frame(rep_list, bg=CARD)
+        r_agent.pack(fill="x", pady=2)
+        ttk.Radiobutton(
+            r_agent,
+            text="In-Database Agent Analysis (Autonomous agent analysis inside IDA -> MD, HTML, PDF report)",
+            variable=self.v_report_mode,
+            value="investigate",
+            command=self._report_mode_changed,
+        ).pack(side="left")
+        make_help_badge(
+            r_agent,
+            "Runs autonomous multi-turn agent analysis querying IDA APIs (decompilation, xrefs, hex bytes) to produce Markdown, HTML, and vector PDF reports.",
+        ).pack(side="left", padx=6)
+
+        self.turns_row = tk.Frame(rep_list, bg=CARD)
+        tk.Label(self.turns_row, text="Investigation Turns:", bg=CARD, fg=MUTED, font=SUB_FONT).pack(side="left", padx=(20, 6))
+        ttk.Spinbox(self.turns_row, from_=3, to=30, textvariable=self.v_turns, width=5).pack(side="left")
+        tk.Label(self.turns_row, text="(3 to 30 turns)", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left", padx=6)
+        if self.v_report_mode.get() == "investigate":
+            self.turns_row.pack(fill="x", pady=(2, 4))
+
+        # 3. Exported Workspace CLI Agent
+        r_ws = tk.Frame(rep_list, bg=CARD)
+        r_ws.pack(fill="x", pady=2)
+        self.rb_ws_analysis = ttk.Radiobutton(
+            r_ws,
+            text="Exported Workspace CLI Agent (Autonomous agent analysis on exported C workspace -> MD report)",
+            variable=self.v_report_mode,
+            value="workspace_analysis",
+            command=self._report_mode_changed,
+        )
+        self.rb_ws_analysis.pack(side="left")
+        self.ws_analysis_badge = make_help_badge(
+            r_ws,
+            "Instructs an autonomous CLI agent (Claude Code, Antigravity CLI, OpenCode, Copilot CLI) to inspect the exported workspace and generate a structured malware research report.",
+        )
+        self.ws_analysis_badge.pack(side="left", padx=6)
+
+        # Output Directory Sub-section
+        ttk.Separator(ops_card).pack(fill="x", pady=(6, 8))
+        out_hdr = tk.Frame(ops_card, bg=CARD)
+        out_hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(out_hdr, text="📁", bg=CARD, fg=SKY, font=CARD_ICON_FONT).pack(side="left", padx=(0, 10))
+        out_text = tk.Frame(out_hdr, bg=CARD)
+        out_text.pack(side="left", fill="x", expand=True)
+        tk.Label(out_text, text="Output Directory", bg=CARD, fg=FG, font=TITLE_FONT).pack(anchor="w")
+        tk.Label(out_text, text="Directory to store the analysis results", bg=CARD, fg=DIM, font=SUB_FONT).pack(anchor="w")
+
+        orow = tk.Frame(ops_card, bg=CARD)
+        orow.pack(fill="x", pady=(4, 0))
+        orow.columnconfigure(0, weight=1)
+        ttk.Entry(orow, textvariable=self.v_output).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        RoundedButton(orow, "📁 Browse...", command=lambda: self._pick_dir(self.v_output), bg_color=CARD, radius=6, padx=10, pady=4).grid(row=0, column=1)
+
+        # Card C: Environment and Configuration
+        ida_card = card(left_inner)
+        ida_card.pack(fill="x", pady=(0, 0))
+        card_header(ida_card, "🖥", "Environment & Configuration", "Configure IDA Pro executable and analysis engine settings")
 
         ida_grid = tk.Frame(ida_card, bg=CARD)
         ida_grid.pack(fill="x")
@@ -946,14 +1241,37 @@ class OmniApp:
         brow.grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Spinbox(brow, from_=1, to=50, textvariable=self.v_batch, width=5).pack(side="left")
         make_help_badge(brow, "Sequential requests per IDA headless session to manage rate limits and memory.").pack(side="left", padx=6)
-        tk.Label(brow, text="Sequential requests per IDA headless session", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
+        tk.Label(brow, text="Sequential requests per IDA session", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
 
-        # 5. Run Bar (Curved Edge Run OmniIDB + Curved Cancel + Sample Count)
-        run_bar = tk.Frame(outer, bg=BG)
-        run_bar.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        # Row 3: Rename Cache
+        tk.Label(ida_grid, text="Rename Cache:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=2, column=0, pady=(6, 0), sticky="w")
+        crow = tk.Frame(ida_grid, bg=CARD)
+        crow.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(crow, text="Reuse function & variable names across samples", variable=self.v_cache).pack(side="left")
+        make_help_badge(crow, "Cross-sample consensus cache: skips re-querying AI when identical or structurally matching decompiled code has already been analyzed.").pack(side="left", padx=6)
+        RoundedButton(crow, "Clear Cache", command=self._on_clear_cache, bg_color=CARD, padx=6, pady=2, radius=4).pack(side="left", padx=(6, 6))
+        self.cache_stats_lbl = tk.Label(crow, text=self._format_cache_stats(), bg=CARD, fg=DIM, font=SUB_FONT)
+        self.cache_stats_lbl.pack(side="left")
+
+        # Row 4: Token Budget
+        tk.Label(ida_grid, text="Token Budget:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=3, column=0, pady=(6, 0), sticky="w")
+        trow = tk.Frame(ida_grid, bg=CARD)
+        trow.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Spinbox(trow, from_=0, to=10000000, increment=50000, textvariable=self.v_token_budget, width=10).pack(side="left")
+        make_help_badge(trow, "Batch-wide token spending cap. 0 = unlimited. When exhausted, switches to free fallback or stops billable requests.").pack(side="left", padx=6)
+        tk.Label(trow, text="Batch token cap (0 = unlimited)", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
+
+        # ------------------------------------------------ Right Column: Action Bar + Long Table/Console
+        right_frame = tk.Frame(body_pane, bg=BG)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(1, weight=1)
+
+        # 4. Top Action Bar: Run OmniIDB + Stop + Sample Count
+        run_bar = tk.Frame(right_frame, bg=BG)
+        run_bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         run_bar.columnconfigure(2, weight=1)
 
-        # Prominent curved blue action button
         self.run_btn = RoundedButton(
             run_bar, "▶  Run OmniIDB", command=self.on_run,
             fill=BLUE, hover_fill=BLUE_HOVER, outline="#3B82F6", text_color="#FFFFFF",
@@ -961,20 +1279,19 @@ class OmniApp:
         )
         self.run_btn.pack(side="left", padx=(0, 8))
 
-        # Curved dark cancel button
         self.cancel_btn = RoundedButton(
-            run_bar, "⏹  Cancel", command=self.on_cancel,
+            run_bar, "⏹  Stop", command=self.on_cancel,
             fill=BTN_BG, hover_fill=BTN_HOVER, outline=BTN_BORDER, text_color=FG,
             font=BUTTON_FONT, padx=14, pady=6, radius=6, state="disabled", bg_color=BG,
         )
         self.cancel_btn.pack(side="left")
+        self.stop_btn = self.cancel_btn
 
-        # Right-aligned queue status counter
         self.queue_counter_lbl = tk.Label(run_bar, textvariable=self.v_queued, bg=BG, fg=MUTED, font=UI_FONT)
         self.queue_counter_lbl.pack(side="right")
 
-        # 6. Bottom Console (Unified Tabbed Console with Curved Clear Button)
-        console = card(outer, row=5, column=0, sticky="nsew", pady=(0, 0))
+        # 5. Long Console Card (Sample Queue, Activity Log, ida.log - No Split View)
+        console = card(right_frame, row=1, column=0, sticky="nsew")
         console.columnconfigure(0, weight=1)
         console.rowconfigure(1, weight=1)
 
@@ -986,15 +1303,14 @@ class OmniApp:
         pills.pack(side="left")
         self.tab_buttons: dict[str, tk.Button] = {}
         tab_labels = {
-            "Queue": ("📋", "Sample Queue"),
-            "Log": ("📜", "Activity Log"),
-            "IdaLog": ("📝", "ida.log"),
-            "Split": ("🔲", "Split View"),
+            "Queue": "Sample Queue",
+            "Log": "Activity Log",
+            "IdaLog": "ida.log",
         }
         for key in self.TABS:
-            icon_c, title_c = tab_labels[key]
+            title_c = tab_labels[key]
             b = tk.Button(
-                pills, text=f"{icon_c} {title_c} (0)", relief="flat", bd=0, font=SMALL_BTN_FONT,
+                pills, text=f"{title_c} (0)", relief="flat", bd=0, font=SMALL_BTN_FONT,
                 padx=10, pady=3, command=lambda k=key: self.show_tab(k), cursor="hand2",
                 bg="#0E131D", fg=MUTED, activebackground=BLUE, activeforeground="#FFFFFF",
             )
@@ -1015,23 +1331,12 @@ class OmniApp:
             frame.grid(row=0, column=0, sticky="nsew")
             self.pages[key] = frame
 
-        self.queue_full = QueueView(self.pages["Queue"], compact=False)
+        self.queue_full = QueueView(self.pages["Queue"], compact=False, on_open_output=self.open_sample_output_folder)
         self.queue_full.pack(fill="both", expand=True)
         self.log_view = LogView(self.pages["Log"], activity_color, "Activity log is empty. Click 'Run OmniIDB' to start analysis.")
         self.log_view.pack(fill="both", expand=True)
         self.ida_view = LogView(self.pages["IdaLog"], ida_color, "ida.log is empty. Live IDA Pro decompiler and loader output will stream here.")
         self.ida_view.pack(fill="both", expand=True)
-
-        # Split view
-        split = self.pages["Split"]
-        split.columnconfigure((0, 1), weight=1, uniform="split")
-        split.rowconfigure(1, weight=1)
-        tk.Label(split, text="Queue", bg=CARD, fg=MUTED, font=UI_FONT_BOLD).grid(row=0, column=0, sticky="w", pady=(0, 4))
-        tk.Label(split, text="Live Activity Log", bg=CARD, fg=MUTED, font=UI_FONT_BOLD).grid(row=0, column=1, sticky="w", padx=(6, 0), pady=(0, 4))
-        self.queue_compact = QueueView(split, compact=True)
-        self.queue_compact.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
-        self.split_log = LogView(split, activity_color, "Activity log is empty.")
-        self.split_log.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
 
         self._build_controls()
         self._update_tab_titles()
@@ -1044,13 +1349,14 @@ class OmniApp:
 
         # Curved Edge Red-accented Clear button
         clear_btn = RoundedButton(
-            c, "🗑 Clear", command=self._on_clear_active_tab,
+            c, "Clear", command=self._on_clear_active_tab,
             fill="#2A141A", hover_fill="#3D1822", outline="#7F1D1D", text_color="#FCA5A5",
             font=SMALL_BTN_FONT, padx=8, pady=2, radius=6, bg_color=CARD,
         )
         clear_btn.pack(side="right", padx=(6, 0))
+        clear_btn.pack(side="right", padx=(6, 0))
 
-        if tab in ("Log", "Split"):
+        if tab == "Log":
             RoundedButton(c, "Copy", command=lambda: self._copy("\r\n".join(self.logs)), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
         if tab == "IdaLog":
             RoundedButton(c, "Copy", command=lambda: self._copy("\r\n".join(self.ida_logs)), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
@@ -1067,7 +1373,7 @@ class OmniApp:
                 ).pack(side="right", padx=2)
 
     def _on_clear_active_tab(self) -> None:
-        if self.console_tab in ("Log", "Split"):
+        if self.console_tab == "Log":
             self._clear_logs()
         elif self.console_tab == "IdaLog":
             self._clear_ida_logs()
@@ -1102,35 +1408,52 @@ class OmniApp:
         self.select_all_btn.set_text("Deselect All" if new_val else "Select All")
 
     def _workspace_toggled(self) -> None:
-        if self.v_workspace.get():
-            self.analyze_ws_row.pack(fill="x", pady=(1, 3), after=self.ws_row)
-            self._update_analyze_workspace_state()
+        if not self.v_workspace.get():
+            if self.v_report_mode.get() == "workspace_analysis":
+                self.v_report_mode.set("none")
+                self._report_mode_changed()
+        self._update_analyze_workspace_state()
+
+    def _report_mode_changed(self) -> None:
+        mode = self.v_report_mode.get()
+        self.v_agent.set(mode == "investigate")
+        self.v_analyze_workspace.set(mode == "workspace_analysis")
+
+        if mode == "investigate":
+            self.turns_row.pack(fill="x", pady=(2, 4))
         else:
-            self.analyze_ws_row.pack_forget()
-            self.v_analyze_workspace.set(False)
+            self.turns_row.pack_forget()
+
+        if mode == "workspace_analysis":
+            if not self.v_workspace.get():
+                self.v_workspace.set(True)
+                self._workspace_toggled()
 
     def _update_analyze_workspace_state(self) -> None:
-        if not hasattr(self, "chk_analyze_ws"):
+        if not hasattr(self, "rb_ws_analysis"):
             return
         provider = self.v_provider.get()
         cli_mode = is_cli_provider(provider)
         if cli_mode:
-            self.chk_analyze_ws.configure(state="normal")
-            if hasattr(self.analyze_ws_badge, "tooltip"):
-                self.analyze_ws_badge.tooltip.text = (
-                    "Instructs the autonomous CLI agent to inspect the exported workspace "
-                    "and generate a structured malware analysis report."
+            self.rb_ws_analysis.configure(state="normal")
+            if hasattr(self.ws_analysis_badge, "tooltip"):
+                self.ws_analysis_badge.tooltip.text = (
+                    "Instructs the autonomous CLI agent (Claude Code, Antigravity CLI, OpenCode, Copilot CLI) "
+                    "to inspect the exported workspace and generate a structured malware research report.\n"
+                    "Selecting this mode automatically enables 'Export OmniIDB AI workspace'."
                 )
-            self.analyze_ws_badge.configure(fg=DIM)
+            self.ws_analysis_badge.configure(fg=DIM)
         else:
-            self.v_analyze_workspace.set(False)
-            self.chk_analyze_ws.configure(state="disabled")
-            if hasattr(self.analyze_ws_badge, "tooltip"):
-                self.analyze_ws_badge.tooltip.text = (
+            if self.v_report_mode.get() == "workspace_analysis":
+                self.v_report_mode.set("none")
+                self._report_mode_changed()
+            self.rb_ws_analysis.configure(state="disabled")
+            if hasattr(self.ws_analysis_badge, "tooltip"):
+                self.ws_analysis_badge.tooltip.text = (
                     "⚠ Disabled for direct API providers to prevent excessive token consumption.\n"
                     "Select a CLI Agent provider (Claude Code, Antigravity CLI, OpenCode, Copilot CLI) to enable."
                 )
-            self.analyze_ws_badge.configure(fg=AMBER)
+            self.ws_analysis_badge.configure(fg=AMBER)
 
     def _toggle_status_filter(self, key: str) -> None:
         self.v_status_filter.set("All" if self.v_status_filter.get() == key and key != "All" else key)
@@ -1143,7 +1466,6 @@ class OmniApp:
     def _clear_logs(self) -> None:
         self.logs.clear()
         self.log_view.clear()
-        self.split_log.clear()
         self._update_tab_titles()
 
     def _clear_ida_logs(self) -> None:
@@ -1151,11 +1473,36 @@ class OmniApp:
         self.ida_view.clear()
         self._update_tab_titles()
 
+    def open_sample_output_folder(self, item_id: str) -> None:
+        """Open the target sample's output directory in Windows File Explorer."""
+        try:
+            idx = int(item_id)
+            if 0 <= idx < len(self.samples):
+                sample = self.samples[idx]
+                out_root = self.v_output.get().strip() or self.settings.output_root.strip()
+                if not out_root:
+                    messagebox.showinfo(
+                        "No Output Directory",
+                        "Please specify an output directory first.",
+                        parent=self.root,
+                    )
+                    return
+                from .runner import sanitize, sha256_file
+                digest = sha256_file(sample.path)
+                folder = f"{sanitize(sample.path.stem)}-{digest[:12]}"
+                target = Path(out_root) / folder
+                if not target.exists():
+                    target.mkdir(parents=True, exist_ok=True)
+                os.startfile(str(target))
+        except Exception as exc:
+            messagebox.showerror("Error Opening Folder", f"Could not open output folder:\n{exc}", parent=self.root)
+
     def _agent_toggled(self) -> None:
         if self.v_agent.get():
-            self.turns_row.pack(fill="x", pady=(2, 4))
-        else:
-            self.turns_row.pack_forget()
+            self.v_report_mode.set("investigate")
+        elif self.v_report_mode.get() == "investigate":
+            self.v_report_mode.set("none")
+        self._report_mode_changed()
 
     def _shellcode_toggled(self, rescan: bool = True) -> None:
         self.arch_box.configure(state="readonly" if self.v_shellcode.get() else "disabled")
@@ -1171,6 +1518,27 @@ class OmniApp:
         path = filedialog.askopenfilename()
         if path:
             var.set(path)
+
+    def _format_cache_stats(self) -> str:
+        try:
+            from .rename_cache import cache_stats
+            st = cache_stats(cache_path())
+            if not st or (st["function_entries"] == 0 and st["variable_entries"] == 0):
+                return "Cache is empty"
+            size_kb = st["file_bytes"] / 1024
+            return f"{st['function_entries']} fn, {st['variable_entries']} var ({size_kb:.1f} KB, {st['total_hits']} hits)"
+        except Exception:
+            return ""
+
+    def _on_clear_cache(self) -> None:
+        if messagebox.askyesno("Clear Rename Cache", "Clear all cached function and variable names?"):
+            try:
+                from .rename_cache import clear_cache_file
+                clear_cache_file(cache_path())
+                if hasattr(self, "cache_stats_lbl"):
+                    self.cache_stats_lbl.config(text=self._format_cache_stats())
+            except Exception as exc:
+                messagebox.showerror("Cache Error", f"Could not clear cache: {exc}")
 
     def choose_input_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -1349,8 +1717,10 @@ class OmniApp:
         text = self.settings.genesect_root.strip()
         return Path(text) if text else (detect_engine_root() or project_root())
 
-    def _needs_key(self, provider: str, key_val: str) -> bool:
-        return not is_signed_in_provider(provider) and provider not in KEYLESS_PROVIDERS and not key_val.strip()
+    def _needs_key(self, provider: Optional[str] = None, key_val: Optional[str] = None) -> bool:
+        p = provider if provider is not None else self.v_provider.get()
+        k = key_val if key_val is not None else self.v_key.get()
+        return not is_signed_in_provider(p) and p not in KEYLESS_PROVIDERS and not k.strip()
 
     def start_test_connection(self, target: str = "main") -> None:
         self.testing_target = target
@@ -1485,8 +1855,7 @@ class OmniApp:
             msg = "No samples match the active filter."
         else:
             msg = None
-        for view in (self.queue_full, self.queue_compact):
-            view.refresh(rows, msg)
+        self.queue_full.refresh(rows, msg)
 
     # ------------------------------------------------------------ tab switching
     def show_tab(self, tab: str) -> None:
@@ -1501,15 +1870,14 @@ class OmniApp:
                 fg="#FFFFFF" if active else MUTED,
             )
         self._build_controls()
-        if tab in ("Queue", "Split"):
+        if tab == "Queue":
             self._render_queue()
 
     def _update_tab_titles(self) -> None:
         tab_names = {
-            "Queue": f"📋 Sample Queue ({len(self.samples)})",
-            "Log": f"📜 Activity Log ({len(self.logs)})",
-            "IdaLog": f"📝 ida.log ({len(self.ida_logs)})",
-            "Split": "🔲 Split View",
+            "Queue": f"Sample Queue ({len(self.samples)})",
+            "Log": f"Activity Log ({len(self.logs)})",
+            "IdaLog": f"ida.log ({len(self.ida_logs)})",
         }
         for key, title in tab_names.items():
             if key in self.tab_buttons:
@@ -1517,54 +1885,63 @@ class OmniApp:
 
     # ------------------------------------------------------------ batch run
     def on_run(self) -> None:
-        if self.running:
-            return
-        self._pull_settings()
-        error = None
-        if not self.samples:
-            error = "No samples discovered. Choose a sample file or directory."
-        elif not self.settings.ida_path.strip() or not Path(self.settings.ida_path).is_file():
-            error = f"IDA executable not found at '{self.settings.ida_path}'."
-        elif not self.settings.output_root.strip():
-            error = "Please specify an output directory."
-        elif self._needs_key():
-            error = f"An API key is required for provider '{self.v_provider.get()}'."
-
-        if error:
-            messagebox.showerror("Cannot Start OmniIDB", error, parent=self.root)
-            return
-
         try:
-            self.settings.save()
-        except OSError:
-            pass
+            if self.running:
+                return
+            self._pull_settings()
+            if not self.samples and self.v_input.get().strip():
+                self.refresh_samples()
 
-        for sample in self.samples:
-            sample.status = "Ready"
-            sample.stage = "-"
-            sample.start_time = None
-            sample.elapsed_seconds = None
-        self.logs.clear()
-        self.ida_logs.clear()
-        self.log_view.clear()
-        self.split_log.clear()
-        self.ida_view.clear()
-        self.progress_current, self.progress_total = 0, len(self.samples)
-        self.running = True
-        self._last_time_tick = time.time()
-        self._set_running_ui(True)
-        if self.console_tab == "Queue":
-            self.show_tab("Split")
+            error = None
+            if not self.samples:
+                error = "No samples discovered. Choose a sample file or directory."
+            elif not self.settings.ida_path.strip() or not Path(self.settings.ida_path).is_file():
+                error = f"IDA executable not found at '{self.settings.ida_path}'."
+            elif not self.settings.output_root.strip():
+                error = "Please specify an output directory."
+            elif self._needs_key(self.v_provider.get(), self.v_key.get()):
+                error = f"An API key is required for provider '{self.v_provider.get()}'."
+            elif self.v_fallback_enabled.get() and self._needs_key(self.v_fallback_provider.get(), self.v_fallback_key.get()):
+                error = f"An API key is required for fallback provider '{self.v_fallback_provider.get()}'."
 
-        self.cancel = runner.start(
-            RunRequest(
-                self.settings,
-                self.v_key.get(),
-                list(self.samples),
-                fallback_api_key=self.v_fallback_key.get(),
-            ),
-            self.events,
-        )
+            if error:
+                messagebox.showerror("Cannot Start OmniIDB", error, parent=self.root)
+                return
+
+            try:
+                self.settings.save()
+            except OSError:
+                pass
+
+            for sample in self.samples:
+                sample.status = "Ready"
+                sample.stage = "-"
+                sample.start_time = None
+                sample.elapsed_seconds = None
+            self.logs.clear()
+            self.ida_logs.clear()
+            self.log_view.clear()
+            self.ida_view.clear()
+            self.progress_current, self.progress_total = 0, len(self.samples)
+            self.running = True
+            self._last_time_tick = time.time()
+            self._set_running_ui(True)
+            if self.console_tab == "Queue":
+                self.show_tab("Log")
+
+            self.cancel = runner.start(
+                RunRequest(
+                    self.settings,
+                    self.v_key.get(),
+                    list(self.samples),
+                    fallback_api_key=self.v_fallback_key.get(),
+                ),
+                self.events,
+            )
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Run Error", f"Failed to start OmniIDB run:\n\n{exc}", parent=self.root)
 
     def on_cancel(self) -> None:
         if self.cancel:
@@ -1584,10 +1961,8 @@ class OmniApp:
         if len(self.logs) > MAX_LOGS:
             del self.logs[:1000]
             self.log_view.set_lines(self.logs)
-            self.split_log.set_lines(self.logs)
         else:
             self.log_view.append(lines)
-            self.split_log.append(lines)
 
     def _poll(self) -> None:
         new_logs: list[str] = []
@@ -1611,7 +1986,7 @@ class OmniApp:
             self._mark_queue()
         if new_logs or new_ida or self.queue_dirty:
             self._update_tab_titles()
-        if self.queue_dirty and self.console_tab in ("Queue", "Split"):
+        if self.queue_dirty and self.console_tab == "Queue":
             self.queue_dirty = False
             self._render_queue()
         self.root.after(100, self._poll)
@@ -1647,7 +2022,7 @@ class OmniApp:
             new_logs.append(d["message"])
         elif kind == "ida_log_line":
             new_ida.append(d["message"])
-        elif kind == "genesect_event":
+        elif kind in ("omni_event", "genesect_event"):
             pass
         elif kind == "provider_switch":
             src = d.get("provider_from") or "primary"

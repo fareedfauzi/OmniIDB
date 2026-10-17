@@ -151,29 +151,99 @@ If your primary API provider hits rate limits or token limits, check **Enable Fa
 
 ## Output Folder Layout
 
-Each sample gets a subfolder named `<name>-<sha256>`:
+Each sample gets a subfolder named `<name>-<sha256[:12]>`:
 
 ```text
-C:\Output\sample.exe-a1b2c3d4\
+C:\Output\sample.exe-a1b2c3d4e5f6\
 ├── IDB Files\
-│   ├── original.i64            # Untouched IDB right after auto-analysis
-│   └── analyzed.i64            # Renamed IDB with all AI edits
+│   ├── original.i64            # Untouched IDB right after initial auto-analysis
+│   └── analyzed.i64            # Renamed IDB with all AI function & variable names
 ├── AI Workspace\               # (If "Export AI workspace" is checked)
-│   ├── AGENTS.md               # Folder map and instructions for AI agents
-│   ├── manifest.json           # Metadata (hashes, entrypoint, compiler)
-│   ├── strings.tsv             # Extracted strings
-│   ├── imports.tsv             # API imports
-│   ├── decompiled\             # C decompilations (sub_*.c)
-│   └── malware_analysis_report.md
+│   ├── AGENTS.md               # Quick-start orientation guide for coding agents
+│   ├── README.md               # Sample overview, module counts, and suspicious functions
+│   ├── CLAUDE.md               # Pointer to AGENTS.md
+│   ├── headers\
+│   │   ├── omni_types.h        # IDA local types + Hex-Rays compatibility shims
+│   │   └── signatures.h        # Recovered function declarations and prototypes
+│   ├── modules\                # Functions grouped by behavioral category
+│   │   ├── 00_entry_runtime\   # Entry points, DllMain, TLS, CRT start-up
+│   │   ├── 01_network_c2\      # Sockets, WinINet/WinHTTP, URLs, C2 beaconing
+│   │   ├── 02_crypto_encoding\ # Ciphers, hashes, Base64/XOR routines
+│   │   ├── 03_evasion_injection\# Dynamic API resolve, injection, anti-debug
+│   │   ├── 04_system_files\    # Registry, file system, processes
+│   │   ├── 05_stealer_credentials\# DPAPI, browser vaults, keyloggers, clipboard
+│   │   ├── 06_persistence_autorun\# Services, scheduled tasks, Run keys, startup
+│   │   ├── 07_discovery_recon\ # Host profiling, network/share enumeration, user recon
+│   │   ├── 08_lateral_movement\# Named pipes, remote RPC, PsExec patterns
+│   │   ├── 09_compression_archive\# Zlib, LZMA, CAB, ZIP extraction & packing
+│   │   ├── 10_driver_kernel_ipc\# DeviceIoControl, driver loading, raw disk access
+│   │   ├── 11_gui_interface\   # Windows message loops, dialogs, UI controls
+│   │   ├── 98_library_thunks\  # FLIRT matches and import stubs
+│   │   └── 99_utilities\       # Generic helper functions
+│   │       └── <func>.c        # Decompiled C code with types header include
+│   │       └── <func>.asm      # Full IDA disassembly
+│   │       └── <func>.brief.md # Per-function summary: callers, callees, APIs, triage score
+│   └── catalog\                # Machine-readable JSON indexes
+│       ├── functions.json      # All functions with prototype, callers, callees, triage
+│       ├── triage_indicators.json # Suspicious signals (crypto, injection, stack buffers)
+│       ├── strings.json        # Classified strings (URLs, IPs, registry keys, commands)
+│       ├── imports.json        # Imports categorized by capability with caller list
+│       ├── exports.json        # Exported functions and ordinals
+│       ├── sections.json       # PE/ELF segments with entropy calculation
+│       ├── callgraph.json      # Adjacency list of call edges
+│       ├── callgraph.tsv       # Tab-separated caller-callee pairs
+│       └── sample.json         # Architecture, hashes, bitness, and image base
 ├── report\                     # (If "Autonomous Investigation" is checked)
-│   ├── report.md               # Markdown report with MITRE tags
-│   ├── report.html             # Dark-mode HTML report
-│   ├── report.pdf              # PDF report
-│   └── report_model.json
+│   ├── report.md               # Markdown report with MITRE ATT&CK mappings
+│   ├── report.html             # Standalone dark-mode HTML report
+│   ├── report.pdf              # PDF report deliverable
+│   └── report_model.json       # Evidence-gated JSON report model
 ├── logs\
 │   ├── ida.log                 # Raw IDA console output
-│   └── failure.txt             # Error log (if failed)
-└── result.json                 # Run stats (runtime, rename counts)
+│   └── failure.txt             # Error log with traceback (if a run failed)
+└── result.json                 # Execution stats, rename counts, cache hits, token usage
+```
+
+---
+
+## Workspace Exporter Design
+
+The workspace exporter redesign organizes binary decompilations into an offline structure that coding agents (like Claude Code, Antigravity CLI, or Cursor) and human analysts can read without running IDA:
+
+- **Behavioral modules**: Functions are classified into `00_entry_runtime` through `99_utilities` based on the APIs they call, strings referenced, crypto constants (AES S-box, MD5/SHA state, RC4 loops), stack buffer sizes, and call-graph neighbor propagation.
+- **Three files per function**: Each routine has `<stem>.c` (Hex-Rays decompilation with `#include "headers/omni_types.h"`), `<stem>.asm` (IDA disassembly), and `<stem>.brief.md` (quick facts, callers/callees, triage indicators).
+- **Consolidated headers**: Local types recovered from IDA's Type Info Library are exported to `headers/omni_types.h` alongside editor-friendly shims for Hex-Rays annotations (`__usercall`, `__int64`, etc.).
+- **Triage catalog**: `catalog/triage_indicators.json` ranks suspicious routines by weighted heuristics (dynamic API resolution, process injection, crypto constants, command lines) to prioritize where to start reading.
+
+---
+
+## Rename Cache & Cross-Sample Consensus
+
+Analyzing dozens of samples across malware campaigns often encounters repeated code (standard helper routines, crypto algorithms, decompression stubs). OmniIDB includes a persistent SQLite rename cache (`%LOCALAPPDATA%\OmniIDB\rename_cache.sqlite3`):
+
+- **Normalized fingerprinting**: Generates exact and structural fingerprints by masking local variable names (`V0`, `V1`, ...), call addresses, and numeric literals so identical logic matches across different base addresses and compilers.
+- **Consensus matching**: Reuses function names only when structural matches achieve at least 60% agreement across stored samples.
+- **Variable cache**: Maps canonical variable order back to renamed variables, skipping repetitive LLM requests.
+- **Management in GUI**: Enable/disable the cache with a single checkbox or click **Clear Cache** in the *IDA Pro & Environment Configuration* card to reset the database.
+
+---
+
+## Token & Cost Tracking with Budget Cap
+
+To keep API usage transparent and prevent unexpected bills:
+
+- **Token estimates & live cost tracking**: Monitors character counts (~3.5 chars/token) and estimates costs in real time using public price tables for OpenAI, Anthropic, DeepSeek, Google Gemini, OpenRouter, Groq, and Mistral.
+- **Free provider exemptions**: Local models (Ollama, LMStudio), private API endpoints, and signed-in CLI subscriptions (Copilot CLI, Antigravity CLI, Claude Code) are automatically treated as zero-cost.
+- **Batch token budget cap**: Set a maximum token cap under *Token Budget* (e.g. `200000`). If the cap is reached, OmniIDB either fails over to a free fallback provider or gracefully stops further LLM queries for the batch while safely saving all databases and exported workspaces.
+
+---
+
+## Unit Testing
+
+OmniIDB includes a test suite covering module classification, import capabilities, layout generation, fingerprint stability, rename cache roundtrips, and token budgeting:
+
+```powershell
+python -m unittest discover -s tests -v
 ```
 
 ---

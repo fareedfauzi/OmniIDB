@@ -118,6 +118,10 @@ def settings_path() -> Path:
     return legacy if legacy.is_file() else path
 
 
+def cache_path() -> Path:
+    return _config_dir("OmniIDB") / "rename_cache.sqlite3"
+
+
 def path_text(path) -> str:
     return str(path)
 
@@ -207,6 +211,8 @@ class AppSettings:
     shellcode_arch: str = "x64"
     batch_size: int = 5
     cooldown_seconds: int = 0
+    use_rename_cache: bool = True
+    token_budget: int = 0
     fallback_enabled: bool = False
     fallback_provider: str = "Ollama"
     fallback_api_url: str = "http://localhost:11434/v1"

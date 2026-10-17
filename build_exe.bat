@@ -9,6 +9,14 @@ echo          OmniIDB Windows Executable Builder
 echo =======================================================
 echo.
 
+REM 0. Ensure existing OmniIDB instance is closed
+tasklist /fi "imagename eq OmniIDB.exe" 2>nul | findstr /i "OmniIDB.exe" >nul
+if not errorlevel 1 (
+    echo [*] Closing running OmniIDB instance so the binary can be updated...
+    taskkill /f /im OmniIDB.exe >nul 2>&1
+    timeout /t 1 /nobreak >nul
+)
+
 REM 1. Check Python installation
 python --version >nul 2>&1
 if errorlevel 1 (
@@ -51,8 +59,10 @@ echo.
 echo [*] Compiling OmniIDB into standalone Windows executable...
 set ICON_ARG=
 if exist "omni-IDB-logo.ico" set ICON_ARG=--icon="omni-IDB-logo.ico"
+set FONT_ARG=
+if exist "JetBrainsMono.ttf" set FONT_ARG=--add-data "JetBrainsMono.ttf;."
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name OmniIDB !ICON_ARG! --add-data "scripts;scripts" --add-data "omni-IDB-logo.png;." --add-data "omni-IDB-logo.ico;." --collect-all omni_idb omni_idb\__main__.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name OmniIDB !ICON_ARG! !FONT_ARG! --add-data "scripts;scripts" --add-data "omni-IDB-logo.png;." --add-data "omni-IDB-logo.ico;." --collect-all omni_idb omni_idb\__main__.py
 
 if errorlevel 1 (
     echo.

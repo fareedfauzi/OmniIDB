@@ -18,15 +18,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .config import AppSettings, auth_script, find_genesect_package_root, project_root, runner_script
+from .config import AppSettings, auth_script, cache_path, find_genesect_package_root, project_root, runner_script
 from .discovery import Sample, SampleKind
 from . import reporting
 
-EVENT_PREFIX = "GENESECT_EVENT "
+EVENT_PREFIX = "OMNI_EVENT "
+LEGACY_EVENT_PREFIX = "GENESECT_EVENT "
 
 
 @dataclass
-class GenesectEvent:
+class OmniEvent:
     sample_index: int
     kind: str
     level: Optional[str]
@@ -35,6 +36,10 @@ class GenesectEvent:
     total: Optional[int]
     message: str
     raw: str
+
+
+# Legacy alias
+GenesectEvent = OmniEvent
 
 
 @dataclass
@@ -73,13 +78,29 @@ def _run_all(request: RunRequest, q, cancelled: threading.Event) -> None:
     total = len(request.samples)
     _post(q, "batch_started", total=total)
     succeeded = failed = 0
+    settings = request.settings
+    initial_budget = int(getattr(settings, "token_budget", 0) or 0)
+    remaining_budget = initial_budget if initial_budget > 0 else None
+    batch_tokens = 0
+    batch_cost = 0.0
+
     for index, sample in enumerate(request.samples):
         if cancelled.is_set():
             break
         _post(q, "sample_started", index=index, path=sample.path)
         _post(q, "progress", current=index, total=total, message=f"Opening {sample.path} in IDA")
         try:
-            message = _run_one(index, sample, request, q, cancelled)
+            message, sample_result = _run_one(index, sample, request, q, cancelled, remaining_budget=remaining_budget)
+            if sample_result and isinstance(sample_result, dict):
+                usage = sample_result.get("usage")
+                if usage:
+                    billable = usage.get("billable_tokens", 0)
+                    batch_tokens += usage.get("total_tokens", 0)
+                    batch_cost += usage.get("estimated_cost_usd", 0.0)
+                    if remaining_budget is not None:
+                        remaining_budget = max(0, remaining_budget - billable)
+                        if remaining_budget == 0:
+                            _post(q, "log", message="Batch token budget has been fully consumed.")
         except Exception as error:  # noqa: BLE001 - every failure is reported per sample
             failed += 1
             message = f"{sample.path}: {error}"
@@ -89,6 +110,9 @@ def _run_all(request: RunRequest, q, cancelled: threading.Event) -> None:
             succeeded += 1
             _post(q, "sample_finished", index=index, ok=True, message=message)
     was_cancelled = cancelled.is_set()
+    if batch_tokens > 0:
+        cost_str = f" (~${batch_cost:.3f})" if batch_cost > 0 else ""
+        _post(q, "log", message=f"Batch AI totals: {batch_tokens:,} tokens{cost_str}")
     _post(
         q,
         "progress",
@@ -144,7 +168,7 @@ def _spawn_ida(ida: Path, args: list[str], script_arg: str, sample_path: Path, e
     return subprocess.Popen([str(ida), *args, script_arg, str(sample_path)], **kwargs)
 
 
-def _tail_file(path: Path, stop: threading.Event, q) -> None:
+def _tail_file(path: Path, stop: threading.Event, q, index: Optional[int] = None) -> None:
     handle = None
     pending = ""
 
@@ -160,6 +184,8 @@ def _tail_file(path: Path, stop: threading.Event, q) -> None:
                 pending = ""
                 if line:
                     _post(q, "ida_log_line", message=line)
+                    if index is not None:
+                        _handle_ida_line(index, line, q)
             else:
                 break
 
@@ -192,7 +218,7 @@ def _pipe_lines(stream, out: "queue.Queue[str]") -> None:
     threading.Thread(target=pump, daemon=True).start()
 
 
-def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: threading.Event) -> str:
+def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: threading.Event, remaining_budget: Optional[int] = None) -> tuple[str, dict]:
     settings = request.settings
     ida = Path(settings.ida_path.strip())
     if not ida.is_file():
@@ -243,6 +269,10 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
         "batch_size": settings.batch_size,
         "cooldown_seconds": settings.cooldown_seconds,
         "asm_max_lines": 25,
+        "use_rename_cache": getattr(settings, "use_rename_cache", True),
+        "cache_path": str(cache_path().resolve()),
+        "token_budget": remaining_budget if remaining_budget is not None else int(getattr(settings, "token_budget", 0) or 0),
+        "provider": settings.provider,
         "profile": {
             "provider": settings.provider,
             "api_url": settings.api_url,
@@ -260,7 +290,7 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
         },
     }
 
-    fd, job_name = tempfile.mkstemp(prefix="genesect-job-", suffix=".json")
+    fd, job_name = tempfile.mkstemp(prefix="omni-job-", suffix=".json")
     job_file = Path(job_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -287,7 +317,7 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
         _pipe_lines(child.stdout, lines)
         _pipe_lines(child.stderr, lines)
         stop_tail = threading.Event()
-        tail_thread = threading.Thread(target=_tail_file, args=(ida_log, stop_tail, q), daemon=True)
+        tail_thread = threading.Thread(target=_tail_file, args=(ida_log, stop_tail, q, index), daemon=True)
         tail_thread.start()
 
         def flush_lines() -> None:
@@ -346,10 +376,22 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
     renamed = _dig(result, "function_rename", "renamed") or 0
     variables = _dig(result, "variable_rename", "variables_renamed") or 0
     parts = [f"{renamed} functions", f"{variables} variables"]
+    fn_cache_hits = _dig(result, "function_rename", "cache_hits") or 0
+    var_cache_hits = _dig(result, "variable_rename", "cache_hits") or 0
+    total_cache_hits = fn_cache_hits + var_cache_hits
+    if total_cache_hits:
+        parts.append(f"cache: {total_cache_hits} hits")
     findings = _dig(result, "autonomous_investigation", "findings_count")
     if findings is not None:
         turns = _dig(result, "autonomous_investigation", "turns_executed") or 0
         parts.append(f"agent: {findings} findings/{turns} turns")
+
+    usage = result.get("usage")
+    if usage and usage.get("total_tokens"):
+        tokens_desc = f"{usage.get('total_tokens', 0):,} tok"
+        if usage.get("estimated_cost_usd", 0) > 0:
+            tokens_desc += f" (~${usage['estimated_cost_usd']:.3f})"
+        parts.append(tokens_desc)
 
     idb_names = [idb_path.name]
     if original_idb_path.is_file():
@@ -357,7 +399,9 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
     reports = [p.name for p in [report_dir / "report.md", report_dir / "report.html", report_dir / "report.pdf"] if p.is_file()]
     if reports:
         parts.append(f"reports: {', '.join(reports)}")
-    return f"Saved {' & '.join(idb_names)} ({', '.join(parts)})"
+    if result.get("workspace_analysis_report"):
+        parts.append("workspace analysis: done")
+    return f"Saved {' & '.join(idb_names)} ({', '.join(parts)})", result
 
 
 def _dig(value: Any, *keys: str) -> Any:
@@ -372,23 +416,16 @@ def _as_int(value: Any) -> Optional[int]:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
-def _handle_ida_line(index: int, line: str, q) -> None:
-    trimmed = line.strip()
-    payload = None
-    if trimmed.startswith(EVENT_PREFIX):
-        try:
-            payload = json.loads(trimmed[len(EVENT_PREFIX):])
-        except ValueError:
-            payload = None
 STAGE_NAMES = {
-    "functions": "Rename functions",
-    "variables": "Rename variables",
-    "workspace": "Export AI Workspace",
-    "workspace_analysis": "Analyze AI Workspace",
-    "investigation": "Perform Autonomous Investigation",
     "ida": "Opening in IDA",
-    "save": "Saving IDBs",
+    "scan": "Scanning Functions",
+    "functions": "Renaming Functions",
+    "variables": "Renaming Variables",
+    "investigation": "Investigating Sample",
+    "workspace": "Exporting AI Workspace",
+    "workspace_analysis": "Analyzing AI Workspace",
     "report": "Generating Reports",
+    "save": "Saving IDB Files",
     "shellcode": "Loading Shellcode",
 }
 
@@ -397,21 +434,24 @@ def _handle_ida_line(index: int, line: str, q) -> None:
     trimmed = line.rstrip("\r\n")
     if not trimmed:
         return
-    if not trimmed.startswith(EVENT_PREFIX):
-        _post(q, "log", message=trimmed)
+    prefix = None
+    if trimmed.startswith(EVENT_PREFIX):
+        prefix = EVENT_PREFIX
+    elif trimmed.startswith(LEGACY_EVENT_PREFIX):
+        prefix = LEGACY_EVENT_PREFIX
+    if not prefix:
         return
-    payload = trimmed[len(EVENT_PREFIX) :].strip()
+    payload = trimmed[len(prefix) :].strip()
     try:
         payload = json.loads(payload)
     except json.JSONDecodeError:
-        _post(q, "log", message=trimmed)
         return
     if isinstance(payload, dict):
         kind = payload.get("kind") if isinstance(payload.get("kind"), str) else "log"
         message = payload.get("message") if isinstance(payload.get("message"), str) else ""
         level = payload.get("level") if isinstance(payload.get("level"), str) else None
         stage = payload.get("stage") if isinstance(payload.get("stage"), str) else None
-        event = GenesectEvent(
+        event = OmniEvent(
             sample_index=index,
             kind=kind,
             level=level,
@@ -421,6 +461,7 @@ def _handle_ida_line(index: int, line: str, q) -> None:
             message=message,
             raw=trimmed,
         )
+        _post(q, "omni_event", event=event)
         _post(q, "genesect_event", event=event)
         if stage and stage in STAGE_NAMES:
             _post(q, "sample_stage", index=index, stage=STAGE_NAMES[stage])
@@ -434,9 +475,8 @@ def _handle_ida_line(index: int, line: str, q) -> None:
             )
         if kind in ("progress", "stage"):
             _post(q, "sample_status", index=index, status=message)
-        _post(q, "log", message=message)
-    elif trimmed:
-        _post(q, "log", message=trimmed)
+        if message:
+            _post(q, "log", message=message)
 
 
 # --------------------------------------------------------------------------
