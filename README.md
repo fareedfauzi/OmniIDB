@@ -1,336 +1,203 @@
 <p align="center">
-  <img src="omni-IDB-logo.png" alt="OmniIDB Logo" width="160">
+  <img src="omni-IDB-logo.png" alt="OmniIDB Logo" width="140">
 </p>
 
 # OmniIDB
 
-<p align="center">
-  <strong>Autonomous Bulk AI Reverse Engineering & IDB Enrichment Workbench for Hex-Rays IDA Pro</strong>
-</p>
+Batch reverse engineering and IDA database enrichment using AI.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.9+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.9+">
-  <img src="https://img.shields.io/badge/GUI-Tkinter%20(Zero--Dependency)-0F172A?style=flat" alt="Tkinter">
-  <img src="https://img.shields.io/badge/IDA%20Pro-8.3%20|%209.x-006699?style=flat" alt="IDA Pro">
-  <img src="https://img.shields.io/badge/License-MIT-green?style=flat" alt="License">
-</p>
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
+[![IDA Pro](https://img.shields.io/badge/IDA%20Pro-8.3%20|%209.x-green.svg)](https://hex-rays.com/ida-pro/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
-**OmniIDB** is a standalone, pure-Python desktop workbench and headless batch orchestrator for automated reverse engineering and database enrichment in **Hex-Rays IDA Pro**. It processes single binaries or entire malware sample repositories unattended, executing semantic subroutine renaming, Hex-Rays variable recovery, offline AI workspace generation, and autonomous multi-turn investigations.
+**OmniIDB** is a desktop GUI and headless batch runner for **Hex-Rays IDA Pro**. Instead of opening IDA files one by one, you point OmniIDB at a binary or a folder of samples. It runs IDA in headless mode, uses LLMs to rename `sub_*` functions and local variables, exports decompiled C workspaces, and saves the updated `.i64` databases.
 
-> [!NOTE]
-> **Based on Genesect**: OmniIDB is built upon the concepts and reverse-engineering capabilities of [Genesect](https://github.com/fareedfauzi/Genesect). While **Genesect** focuses on interactive, in-IDE real-time AI assistance as an active IDA Pro plugin, **OmniIDB** is purpose-built for **bulk sample triage and automated IDB persistence (`.i64`)**—running headlessly across queues of binaries unattended.
-
-OmniIDB requires **no third-party pip dependencies** to run its GUI or core engine—it runs on the standard Python distribution bundled with Windows or IDA Pro.
+> **Note on Genesect**: This project is based on [Genesect](https://github.com/fareedfauzi/Genesect) by Fareed Fauzi. Where Genesect focuses on an interactive IDA Pro plugin for working inside IDA on a single sample, OmniIDB focuses on bulk batch jobs: feeding in multiple samples, running them unattended, and saving `original.i64` and `analyzed.i64` databases to disk.
 
 ---
 
 ## Table of Contents
 
-- [Key Features](#key-features)
-- [Relationship to Genesect & Acknowledgements](#relationship-to-genesect--acknowledgements)
+- [What It Does](#what-it-does)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
-- [Analysis Operations](#analysis-operations)
-  - [1. Semantic Function Renaming](#1-semantic-function-renaming)
-  - [2. Local Variable & Parameter Recovery](#2-local-variable--parameter-recovery)
-  - [3. Export AI Workspace & Context Pack](#3-export-ai-workspace--context-pack)
-  - [4. Proceed Analysis of Exported AI Workspace (CLI Agents)](#4-proceed-analysis-of-exported-ai-workspace-cli-agents)
-  - [5. Autonomous Agentic Investigation (Multi-Turn REAI)](#5-autonomous-agentic-investigation-multi-turn-reai)
-- [Supported AI Providers & Model Discovery](#supported-ai-providers--model-discovery)
-  - [Direct API Providers](#direct-api-providers)
-  - [Local Self-Hosted LLMs](#local-self-hosted-llms)
-  - [Signed-In CLI Agent Providers](#signed-in-cli-agent-providers)
-  - [⚡ Dynamic Live Model Retrieval](#-dynamic-live-model-retrieval)
-  - [Automatic Provider Fallback & Failover](#automatic-provider-fallback--failover)
-- [Workbench UI & Navigation](#workbench-ui--navigation)
-- [Input Filtering & Shellcode Support](#input-filtering--shellcode-support)
-- [Output Directory Structure](#output-directory-structure)
-- [Testing & Verification](#testing--verification)
-- [Troubleshooting & FAQ](#troubleshooting--faq)
+- [Operations Available](#operations-available)
+- [Supported AI Providers](#supported-ai-providers)
+- [Input Formats](#input-formats)
+- [Output Folder Layout](#output-folder-layout)
+- [Relationship to Genesect](#relationship-to-genesect)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ---
 
-## Key Features
+## What It Does
 
-- **Pristine & Enriched IDB Output**: Automatically archives `original.i64` immediately following IDA's initial auto-wait, followed by `analyzed.i64` containing all AI modifications.
-- **Dependency-Aware Deobfuscation**: Traverses call graphs from leaf routines upwards to resolve semantics before naming parent dispatchers.
-- **Real-Time Sample Queue Telemetry**: Displays per-sample status, elapsed execution time (`mm:ss`), and live pipeline stages (*Rename functions*, *Rename variables*, *Export AI Workspace*, *Analyze AI Workspace*, *Perform Autonomous Investigation*).
-- **Auto-Failover Protection**: Auto-switches to a secondary fallback provider if primary tokens or rate limits are exceeded.
-- **Offline Workspace Packaging**: Dumps decompiled C code, notable strings, imported APIs, and graph models into an offline context folder with `AGENTS.md`.
-- **Publication-Grade Reports**: Generates technical intelligence dossiers in Markdown, styled dark-mode HTML, and vector PDF (ReportLab or built-in standard-library PDF generator).
-- **Zero PIP Bloat**: Core engine, GUI, and batch runners utilize only Python standard library modules (`tkinter`, `urllib`, `sqlite3`, `subprocess`, `queue`).
+- **Batch processing**: Queue up a single binary or entire directories of malware samples.
+- **Saves two IDBs**: Keeps `original.i64` (captured right after IDA finishes initial auto-analysis) and `analyzed.i64` (after functions and variables are renamed).
+- **Function & variable renaming**: Uses bottom-up call graph analysis so leaf functions get renamed first, giving better context when naming parent functions.
+- **Offline AI workspace export**: Dumps decompiled C functions (`decompiled/*.c`), strings, imports, and an `AGENTS.md` file you can feed to external coding agents.
+- **AI workspace report (CLI agents)**: Lets agents like Antigravity CLI, Claude Code, or OpenCode review the exported workspace and write a technical malware report.
+- **Autonomous multi-turn investigation**: An interactive loop where the LLM queries IDA, checks cross-references, and generates Markdown, HTML, and PDF reports.
+- **Provider fallback**: Auto-switches to a secondary provider (e.g. local Ollama) if your primary API runs out of tokens or hits rate limits.
+- **No pip dependencies needed**: The GUI and runner use standard Python libraries (`tkinter`, `urllib`, `subprocess`, `sqlite3`).
 
 ---
 
 ## Requirements
 
-1. **Operating System**: Windows 10/11 (or Linux/macOS with standard Tkinter support).
-2. **IDA Pro**: IDA Pro 8.3, 8.4, 9.0, 9.1, 9.2, or 9.3 with Hex-Rays Decompiler (`idat.exe` or `ida.exe`).
-3. **Python**: Python 3.9+ with Tkinter.
-4. **AI Connectivity**: At least one of the following:
-   - An API key for **OpenAI**, **Anthropic**, or **DeepSeek**.
-   - A local instance of **Ollama** or **LMStudio**.
-   - A signed-in CLI session (**Antigravity CLI**, **ChatGPT Account**, **Claude Code**, or **OpenCode**).
+1. **Windows 10/11** (or Linux/macOS with Tkinter).
+2. **IDA Pro 8.3+ or 9.x** with Hex-Rays decompiler (`idat.exe` or `ida.exe`).
+3. **Python 3.9+**.
+4. An AI provider:
+   - **Cloud API**: OpenAI, Anthropic, or DeepSeek API key.
+   - **Local LLM**: Ollama or LMStudio.
+   - **Signed-in CLI**: Antigravity CLI (`agy`), Claude Code (`claude`), OpenCode, or ChatGPT account.
 
 ---
 
 ## Quick Start
 
-### 1. Installation (Optional Dependencies)
+### 1. (Optional) Extra Packages
 
-OmniIDB's core engine runs on the Python standard library. To install enhanced packages (high-resolution icon rendering, vector ReportLab PDFs, OpenAI SDK):
+OmniIDB runs out of the box on standard Python. If you want high-res icon rendering, ReportLab PDFs, or the OpenAI SDK:
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 2. Launching the GUI
+### 2. Run the App
 
-Clone or extract OmniIDB and run:
+From PowerShell or CMD:
 
 ```powershell
-# From PowerShell or Command Prompt
+# Run with Python
 python -m omni_idb
 
-# Or using the Windows batch launcher
+# Or use the launcher batch file
 .\omni-idb.bat
+
+# You can also pass a file or folder directly
+python -m omni_idb C:\Samples\malware.exe
 ```
 
-To pre-load a sample file or directory on launch:
+The GUI launches maximized by default.
+
+### 3. Build Standalone `.exe`
+
+To compile everything into a single portable Windows executable:
 
 ```powershell
-python -m omni_idb C:\Malware\Samples
-# or a specific binary:
-python -m omni_idb C:\Malware\Samples\payload.exe
-```
-
-The GUI automatically launches in **maximized full-screen mode** with modern JetBrains Mono typography.
-
-### 3. Compiling to Standalone Windows Executable (.exe)
-
-OmniIDB includes an automated build script `build_exe.bat` that bundles Python, the Tkinter user interface, IDA automation scripts, and the high-resolution application icon into a single, self-contained `OmniIDB.exe`:
-
-```powershell
-# Double-click in Windows Explorer or run from terminal:
 .\build_exe.bat
 ```
 
-The build script automatically:
-1. Verifies Python 3.10+ and `pip`.
-2. Installs or checks build prerequisites (`pyinstaller`, `pillow`, `reportlab`, `openai`).
-3. Generates the multi-resolution icon (`omni-IDB-logo.ico`) from `omni-IDB-logo.png`.
-4. Compiles the binary with the embedded logo icon and offline runtime assets.
-5. Moves `OmniIDB.exe` directly to the project root and automatically removes all intermediate build clutter (`build/`, `dist/`, `.spec` files).
+This generates `OmniIDB.exe` directly in the project root with the embedded custom icon, and cleans up all intermediate build files automatically.
 
 ---
 
-## Analysis Operations
+## Operations Available
 
-OmniIDB allows granular control over which reverse-engineering tasks to run across queued binaries:
+In the UI, you can pick and choose which tasks to run:
 
-```
-[✓] Rename sub_* functions (semantic naming)
-[✓] Rename local variables & parameters
-[ ] Export OmniIDB AI workspace & context pack
-    └── [ ] Proceed analysis of the Exported AI workspace (CLI Agents only)
-[ ] Autonomous Agentic Investigation (multi-turn AI analysis)
-```
-
-### 1. Semantic Function Renaming
-- Runs dependency-aware, bottom-up function naming on unnamed routines (`sub_*`).
-- Analyzes control flow, localized string references, and imported APIs to produce clear, descriptive names (e.g. `aes256_decrypt_payload`, `inject_thread_remote_process`).
-- Leaves user-defined names and standard runtime thunks untouched.
-
-### 2. Local Variable & Parameter Recovery
-- Invokes Hex-Rays decompilation on modified functions to rename stack variables, registers, and function parameters.
-- Replaces generic identifiers (`v1`, `v2`, `a1`) with descriptive domain names (`buffer_len`, `pCiphertext`, `hTargetProcess`).
-
-### 3. Export OmniIDB AI Workspace & Context Pack
-- *(Off by default)*
-- Extracts an offline, portable AI context pack:
-  - `decompiled/*.c`: Clean C decompilations with IDA metadata.
-  - `strings.tsv`: Notable strings with deduplication and IOC classification.
-  - `imports.tsv`: Categorized API imports.
-  - `manifest.json`: Architecture, bitness, entry point, and compiler details.
-  - `AGENTS.md`: Technical instruction layout enabling external agents to navigate the project.
-
-### 4. Proceed Analysis of Exported AI Workspace (CLI Agents)
-- When **Export OmniIDB AI workspace** is enabled, this nested sub-option becomes available.
-- **Direct API Safety Guard**: Disabled for direct API providers (`OpenAI`, `Anthropic`, etc.) to prevent dumping hundreds of thousands of tokens into web APIs.
-- **CLI Agent Execution**: Available when using autonomous agents like **Antigravity CLI (`agy`)**, **Claude Code (`claude`)**, or **OpenCode**.
-- Instructs the agent to explore the exported workspace folder directly on disk, analyze `AGENTS.md` and decompiled code, and author a technical report structured in the writing style of **Kaspersky GReAT**, **ESET Research**, and **Google Threat Intelligence Group**.
-
-### 5. Autonomous Agentic Investigation (Multi-Turn REAI)
-- *(Off by default, configurable from 3 to 30 turns)*
-- Conducts an interactive investigation loop where the model queries IDA memory, extracts cross-references, validates hypotheses, and synthesizes an executive dossier.
-- Produces:
-  - `report/report.md`: Markdown technical report with MITRE ATT&CK mappings.
-  - `report/report.html`: Interactive dark-mode styled HTML report.
-  - `report/report.pdf`: Publication-grade vector PDF.
+| Option | What it does |
+| :--- | :--- |
+| **Rename sub_* functions** | Analyzes control flow, strings, and APIs to give `sub_*` routines descriptive names. |
+| **Rename variables & parameters** | Uses Hex-Rays to replace `v1`, `a1` with meaningful variable names. |
+| **Export AI workspace** | Dumps decompiled C code, imports, strings, and `AGENTS.md` into an offline folder. |
+| **↳ Proceed analysis of workspace** | Available for CLI agents (`agy`, `claude`, `opencode`). The agent reads the exported files and writes a technical report. |
+| **Autonomous Investigation** | Multi-turn agent loop (3–30 turns) that inspects IDA memory and outputs HTML, PDF, and MD reports. |
 
 ---
 
-## Supported AI Providers & Model Discovery
+## Supported AI Providers
 
-OmniIDB supports 10 distinct AI backends:
+OmniIDB supports 10 backends:
 
-| Provider | Type | Authentication | Model Discovery |
-| :--- | :--- | :--- | :--- |
-| **OpenAI** | Cloud API | API Key (`sk-...`) | Dynamic via `GET /v1/models` |
-| **Anthropic** | Cloud API | API Key (`sk-ant-...`) | Dynamic via `GET /v1/models` |
-| **DeepSeek** | Cloud API | API Key (`sk-...`) | Dynamic via `GET /v1/models` |
-| **OpenAICompatible** | Local/Remote API | Optional API Key | Dynamic via `GET /v1/models` |
-| **Ollama** | Local LLM | Keyless (Default: `localhost:11434`) | Dynamic via `GET /api/tags` |
-| **LMStudio** | Local LLM | Keyless (Default: `localhost:1234`) | Dynamic via `GET /v1/models` |
-| **ChatGPTAccount** | Browser Session | Interactive Browser OAuth | Dynamic via `list_models()` |
-| **AntigravityCLI** | Local Agent CLI | Signed-in session (`agy`) | Dynamic via `agy models` |
-| **ClaudeCode** | Local Agent CLI | Signed-in session (`claude`) | Curated Claude 3.5 / 3.7 models |
-| **OpenCode** | Local Agent CLI | `auth.json` provider store | Dynamic via `auth.json` providers |
+| Provider | Setup | Model Discovery |
+| :--- | :--- | :--- |
+| **OpenAI** | API Key (`sk-...`) | Auto-fetches via `/v1/models` |
+| **Anthropic** | API Key (`sk-ant-...`) | Auto-fetches via `/v1/models` |
+| **DeepSeek** | API Key (`sk-...`) | Auto-fetches via `/v1/models` |
+| **OpenAICompatible** | URL + optional key | Auto-fetches via `/v1/models` |
+| **Ollama** | Local (default `localhost:11434`) | Auto-fetches tags |
+| **LMStudio** | Local (default `localhost:1234`) | Auto-fetches models |
+| **ChatGPTAccount** | Browser login (OAuth) | Auto-detects models |
+| **AntigravityCLI** | Local `agy` CLI | Auto-fetches `agy models` |
+| **ClaudeCode** | Local `claude` CLI | Claude 3.5 / 3.7 models |
+| **OpenCode** | Local `opencode` CLI | Reads configured providers |
 
-### ⚡ Dynamic Live Model Retrieval
+### Testing Connections & Model Discovery
+Click **⚡ Test Connection** (or **⚡ Test Main** / **⚡ Test Fallback** if fallback is enabled). OmniIDB checks authentication in-process and automatically populates the model dropdown with available models.
 
-OmniIDB features live model discovery. When you select a provider and click **⚡ Test Connection**:
-
-1. The test runner authenticates against the service.
-2. It actively fetches the live catalogue of models from the provider's endpoint or CLI engine.
-3. The **Model** dropdown (`ttk.Combobox`) is dynamically updated with all available models.
-4. The resolved active model is automatically selected and saved to your configuration.
-
-### Automatic Provider Fallback & Failover
-
-Network instability, cloud token limits, or API rate limits (`HTTP 429`) can disrupt batch runs. OmniIDB solves this with **Automatic Failover**:
-
-1. In the **AI Engine Configuration** card, check **Enable Fallback Provider**.
-2. Select your fallback backend (e.g. Primary: `OpenAI / gpt-5.1`, Fallback: `Ollama / llama3.2` or `AntigravityCLI`).
-3. If the primary provider hits quota limits, context exhaustion, or repeated errors, OmniIDB immediately routes subsequent prompts to the fallback provider.
-4. Failover events are recorded in real-time logs and annotated in the final analysis report.
+### Fallback Provider
+If your primary API provider hits rate limits or token limits, check **Enable Fallback Provider** and pick a backup (like a local Ollama model). OmniIDB will auto-route queries to the fallback if the primary fails.
 
 ---
 
-## Workbench UI & Navigation
+## Input Formats
 
-OmniIDB provides a unified slate-navy interface split into clean operational zones:
-
-1. **Target Sample / Directory**:
-   - Browse for an individual executable or an entire directory of samples.
-   - Toggle recursive subfolder scanning.
-   - Configure architecture options for raw shellcode.
-2. **Analysis Operations**:
-   - Toggles for renaming, workspace packaging, and agentic investigation.
-   - Output path selection.
-3. **AI Engine Configuration**:
-   - Provider selection, API URL, secure masked key entry, and model selection.
-   - Fallback provider setup.
-   - Real-time connection test button and status pill.
-4. **IDA Pro Configuration**:
-   - Auto-detected or custom IDA executable path.
-5. **Multi-Tab Execution Console**:
-   - **`📋 Sample Queue`**: Displays all queued binaries with status chips (`All`, `Pending`, `Running`, `Done`, `Failed`), current stage, and elapsed time.
-   - **`📜 Activity Log`**: Color-coded diagnostic log.
-   - **`📝 ida.log`**: Live stream of IDA Pro kernel messages.
-   - **`🔲 Split View`**: Side-by-side queue and activity console (auto-activated upon starting a run).
+- **Supported binaries**: Windows PE (`.exe`, `.dll`, `.sys`, `.exe_`), Linux ELF, macOS Mach-O, and existing IDA databases (`.idb`, `.i64`).
+- **Raw shellcode**: Check **Accept raw shellcode** and pick the architecture (`x64`, `x86`, `arm`, `arm64`). OmniIDB loads it at offset `0x0`.
+- **Auto-filtering**: Non-binary files (scripts, code, text, images) are skipped automatically during directory scans so your queue stays clean.
 
 ---
 
-## Input Filtering & Shellcode Support
+## Output Folder Layout
 
-### Automated Binary Verification
-OmniIDB validates binaries by reading structural magic headers before queueing them:
-- **Accepted**: Windows PE (`MZ`/`PE`), Linux ELF (`\x7fELF`), macOS Mach-O (`\xfe\xed\xfa\xce`, `\xcf\xfa\xed\xfe`), and existing IDA databases (`.idb`, `.i64`).
-- **Rejected**: Non-executable formats such as images (JPEG, PNG, GIF), documents (PDF, DOCX), archives (ZIP, 7z), text files, or corrupted headers. Rejection reasons are logged.
-
-### Raw Shellcode Support
-For raw shellcode files (`.bin`, `.raw`, `.sc`, `.shellcode`):
-1. Check **Accept raw shellcode**.
-2. Select the target architecture (**x64**, **x86**, **arm**, or **arm64**).
-3. OmniIDB instructs IDA to invoke the binary loader, creates an entry function at offset `0x0`, and executes the analysis pipeline.
-
----
-
-## Output Directory Structure
-
-Each sample is organized in its own isolated subfolder named `<sample_name>-<sha256_prefix>`:
+Each sample gets a subfolder named `<name>-<sha256>`:
 
 ```text
-C:\Output\Downloader.exe-a1b2c3d4\
+C:\Output\sample.exe-a1b2c3d4\
 ├── IDB Files\
-│   ├── original.i64            # Pristine database captured immediately after initial auto-analysis
-│   └── analyzed.i64            # Enriched database with renamed functions, variables, and comments
-├── AI Workspace\               # (Generated when "Export AI workspace" is enabled)
-│   ├── AGENTS.md               # Context documentation for agent navigation
-│   ├── manifest.json           # Binary metadata and properties
-│   ├── strings.tsv             # Extracted strings and IOCs
-│   ├── imports.tsv             # Imported API listings
-│   ├── decompiled\             # Exported C decompilations
-│   │   ├── sub_401000.c
-│   │   └── sub_401520.c
-│   └── malware_analysis_report.md  # Structured report generated by CLI agents
-├── report\                     # (Generated when Autonomous Investigation is enabled)
-│   ├── report_model.json       # Machine-readable triage findings and MITRE tactics
-│   ├── report.md               # Technical markdown report
-│   ├── report.html             # Standalone dark-mode HTML report
-│   └── report.pdf              # Publication-grade vector PDF report
+│   ├── original.i64            # Untouched IDB right after auto-analysis
+│   └── analyzed.i64            # Renamed IDB with all AI edits
+├── AI Workspace\               # (If "Export AI workspace" is checked)
+│   ├── AGENTS.md               # Folder map and instructions for AI agents
+│   ├── manifest.json           # Metadata (hashes, entrypoint, compiler)
+│   ├── strings.tsv             # Extracted strings
+│   ├── imports.tsv             # API imports
+│   ├── decompiled\             # C decompilations (sub_*.c)
+│   └── malware_analysis_report.md
+├── report\                     # (If "Autonomous Investigation" is checked)
+│   ├── report.md               # Markdown report with MITRE tags
+│   ├── report.html             # Dark-mode HTML report
+│   ├── report.pdf              # PDF report
+│   └── report_model.json
 ├── logs\
-│   ├── ida.log                 # Full streaming kernel log from IDA Pro
-│   └── failure.txt             # Diagnostic details (if execution encountered an error)
-└── result.json                 # Execution summary, elapsed time, and rename counts
+│   ├── ida.log                 # Raw IDA console output
+│   └── failure.txt             # Error log (if failed)
+└── result.json                 # Run stats (runtime, rename counts)
 ```
 
 ---
 
-## Testing & Verification
+## Relationship to Genesect
 
-OmniIDB includes a comprehensive regression test suite covering classification, job serialization, stage mapping, and provider discovery:
+OmniIDB is based on [Genesect](https://github.com/fareedfauzi/Genesect) by **Fareed Fauzi**.
 
-```powershell
-python -m unittest discover -s tests
-```
+- **Genesect** is an **in-IDA plugin**: you open IDA, click functions, and chat with the AI helper interactively while analyzing a single binary.
+- **OmniIDB** is a **batch queue tool**: you give it a list of files or a sample folder, it runs IDA in the background, updates the databases, exports workspaces, and writes reports without you having to click through IDA manually.
 
-To compile and verify syntax across all source files:
-
-```powershell
-python -m py_compile omni_idb\app.py omni_idb\config.py omni_idb\runner.py scripts\batch_ida_runner.py scripts\auth_cli.py
-```
-
----
-
-## Troubleshooting & FAQ
-
-#### 1. "Could not find platform dependent libraries <exec_prefix>"
-- This warning may appear in IDA Pro's console when running embedded Python. It is benign and does not affect analysis or script execution.
-
-#### 2. "IDA executable not found"
-- OmniIDB automatically scans default installation directories for IDA Pro (`C:\Program Files\IDA Professional 9.x` or `8.x`). If IDA is installed elsewhere, use the **Browse...** button in the IDA Pro Configuration card to locate `ida.exe` or `idat.exe`.
-
-#### 3. "ChatGPT Account error: Not signed in"
-- Select **ChatGPTAccount** as the provider and click the **↗ Continue with ChatGPT in Browser** button. Complete authentication in your browser window to store credentials under `~/.genesect/chatgpt`.
-
-#### 4. "CLI Agent Workspace Analysis is disabled"
-- Direct API providers (OpenAI, Anthropic, DeepSeek, etc.) do not have local file system access and would consume excessive tokens. To enable **Proceed analysis of the Exported AI workspace**, select a local CLI agent provider (**AntigravityCLI**, **ClaudeCode**, or **OpenCode**).
-
----
-
-## Relationship to Genesect & Acknowledgements
-
-OmniIDB is built upon and inspired by [Genesect](https://github.com/fareedfauzi/Genesect) by **Fareed Fauzi**.
-
-| Capability / Attribute | [Genesect](https://github.com/fareedfauzi/Genesect) | OmniIDB |
+| Feature | Genesect | OmniIDB |
 | :--- | :--- | :--- |
-| **Primary Mission** | In-IDE interactive reverse engineering assistant | Autonomous bulk batch sample analysis & database preservation |
-| **Target Scale** | Single binary under manual analyst inspection | Batch queues across entire directories or repositories of samples |
-| **Workflow Model** | Interactive human-in-the-loop chat & function queries | Headless, unattended automation pipeline with live telemetry |
-| **User Interface** | Embedded dockable IDA Pro plugin panel | Standalone desktop GUI & standalone portable `.exe` workbench |
-| **IDB Persistence** | Modifies active open database inside IDA session | Preserves paired `original.i64` and fully enriched `analyzed.i64` |
-| **Artifacts** | Live function comments, renames in active session | Enriched IDBs, offline C workspaces, MITRE ATT&CK dossiers (HTML/PDF/MD) |
+| **Primary focus** | Interactive analysis inside IDA | Headless bulk batch analysis |
+| **Typical use** | One sample at a time with analyst in the loop | Dozens or hundreds of samples unattended |
+| **Interface** | Dockable panel inside IDA Pro | Standalone GUI or `.exe` launcher |
+| **Output** | Modifies current open IDB | Saves `original.i64` and `analyzed.i64` pairs |
 
-### How They Complement Each Other
-- **[Genesect](https://github.com/fareedfauzi/Genesect)** is the ideal companion when you are actively reverse engineering a specific binary inside IDA Pro and want an AI assistant to explain functions, answer questions, or rename code in real time.
-- **OmniIDB** takes these core decompilation and AI capabilities and scales them for triage: drop dozens or hundreds of unknown malware samples into OmniIDB, run the batch headless, and receive fully deobfuscated and annotated `analyzed.i64` databases, structured offline workspaces, and executive reports without manual intervention.
+---
+
+## Troubleshooting
+
+- **`Could not find platform dependent libraries <exec_prefix>`**: Normal warning from IDA's embedded Python. Safe to ignore.
+- **`IDA executable not found`**: If IDA is in a custom path, click **Browse...** next to IDA Executable and select `ida.exe` or `idat.exe`.
+- **`ChatGPT Account error: Not signed in`**: Select **ChatGPTAccount** and click **Continue with ChatGPT in Browser** to log in once.
+- **`Workspace Analysis option disabled`**: The "Proceed analysis of exported workspace" checkbox is only for local CLI agents (`agy`, `claude`, `opencode`) because sending entire workspaces to cloud APIs consumes too many tokens.
 
 ---
 
 ## License
 
-OmniIDB is licensed under the [MIT License](LICENSE).
+MIT
