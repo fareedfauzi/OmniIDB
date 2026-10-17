@@ -79,6 +79,10 @@ PROVIDER_MAPPING = {
     "OpenAI": ("openai_key", "openai_url", "openai_model"),
     "Anthropic": ("anthropic_key", "anthropic_url", "anthropic_model"),
     "DeepSeek": ("deepseek_key", "deepseek_url", "deepseek_model"),
+    "GoogleGemini": ("custom_key", "custom_url", "custom_model"),
+    "OpenRouter": ("custom_key", "custom_url", "custom_model"),
+    "Groq": ("custom_key", "custom_url", "custom_model"),
+    "Mistral": ("custom_key", "custom_url", "custom_model"),
     "Ollama": (None, "ollama_host", "ollama_model"),
     "LMStudio": ("lmstudio_key", "lmstudio_url", "lmstudio_model"),
     "OpenAICompatible": ("custom_key", "custom_url", "custom_model"),
@@ -86,12 +90,17 @@ PROVIDER_MAPPING = {
     "ClaudeCode": ("claude_code_path", None, "claude_code_model"),
     "AntigravityCLI": ("antigravity_cli_path", None, "antigravity_cli_model"),
     "OpenCode": ("opencode_path", None, "opencode_model"),
+    "CopilotCLI": ("copilot_cli_path", None, "copilot_cli_model"),
 }
-CLI_PROVIDERS = ("ClaudeCode", "AntigravityCLI", "OpenCode")
+CLI_PROVIDERS = ("ClaudeCode", "AntigravityCLI", "OpenCode", "CopilotCLI")
 WORKER_PROVIDER = {
     "OpenAI": "openai",
     "Anthropic": "anthropic",
     "DeepSeek": "deepseek",
+    "GoogleGemini": "custom",
+    "OpenRouter": "custom",
+    "Groq": "custom",
+    "Mistral": "custom",
     "Ollama": "ollama",
     "LMStudio": "lmstudio",
 }
@@ -118,6 +127,11 @@ def apply_profile(profile, config):
         setattr(config, url_attr, api_url)
     if model:
         setattr(config, model_attr, model)
+
+    if provider in ("GoogleGemini", "OpenRouter", "Groq", "Mistral"):
+        setattr(config, "custom_key", api_key)
+        setattr(config, "custom_url", api_url)
+        setattr(config, "custom_model", model)
 
     # The existing bulk workers consume this compact legacy mapping.  A
     # provider-aware adapter below handles account/CLI providers.
@@ -158,6 +172,24 @@ def configure_provider(job, config):
         "custom_prompt": "",
     })
     return worker
+
+
+def query_copilot_cli(executable, model, prompt, sys_prompt, timeout=120):
+    import shutil
+    import subprocess
+    cmd = executable or shutil.which("copilot") or shutil.which("gh") or "copilot"
+    full_prompt = ("%s\n\n%s" % (sys_prompt, prompt)).strip()
+    is_gh = Path(cmd).stem.lower() == "gh"
+    if is_gh:
+        args = [cmd, "copilot", "explain", full_prompt]
+    else:
+        args = [cmd, "-p", full_prompt, "-s"]
+        if model and str(model).lower() != "default":
+            args.extend(["--model", str(model)])
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError("Copilot CLI exited with code %s: %s" % (proc.returncode, proc.stderr.strip() or proc.stdout.strip()))
+    return proc.stdout.strip() or proc.stderr.strip()
 
 
 def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root, job=None):
@@ -247,12 +279,17 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
                 )
                 result = resp.choices[0].message.content or ""
         elif profile_name in CLI_PROVIDERS:
-            from genesect.ai_client import SimpleAI
-            client = SimpleAI(config)
-            result = client._query_signed_in_cli([
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": prompt},
-            ])
+            if profile_name == "CopilotCLI":
+                exe = str(getattr(config, "copilot_cli_path", "") or worker_cfg.get("executable") or "")
+                mdl = str(getattr(config, "copilot_cli_model", "") or worker_cfg.get("model") or "")
+                result = query_copilot_cli(exe, mdl, prompt, sys_prompt)
+            else:
+                from genesect.ai_client import SimpleAI
+                client = SimpleAI(config)
+                result = client._query_signed_in_cli([
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": prompt},
+                ])
         else:
             result = original_request(
                 cfg, prompt, sys_prompt, logger=logger, on_chunk=None,
@@ -1041,7 +1078,7 @@ def run_workspace_analysis(job, cfg, renamer, workspace_path):
     if provider not in CLI_PROVIDERS:
         emit(
             "log",
-            "Workspace analysis skipped: only available for CLI Agent providers (Claude Code, Antigravity CLI, OpenCode) "
+            "Workspace analysis skipped: only available for CLI Agent providers (Claude Code, Antigravity CLI, OpenCode, GitHub Copilot) "
             "to prevent excessive API token consumption.",
             level="warning",
         )

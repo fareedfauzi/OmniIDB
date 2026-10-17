@@ -1128,7 +1128,7 @@ class OmniApp:
             if hasattr(self.analyze_ws_badge, "tooltip"):
                 self.analyze_ws_badge.tooltip.text = (
                     "⚠ Disabled for direct API providers to prevent excessive token consumption.\n"
-                    "Select a CLI Agent provider (Claude Code, Antigravity CLI, OpenCode) to enable."
+                    "Select a CLI Agent provider (Claude Code, Antigravity CLI, OpenCode, Copilot CLI) to enable."
                 )
             self.analyze_ws_badge.configure(fg=AMBER)
 
@@ -1302,10 +1302,10 @@ class OmniApp:
             btn.pack(side="left")
             if self.auth_running:
                 btn.configure_state("disabled")
-        elif provider in ("ClaudeCode", "AntigravityCLI"):
-            name = "Claude" if provider == "ClaudeCode" else "Antigravity"
+        elif provider in ("ClaudeCode", "AntigravityCLI", "CopilotCLI"):
+            name = "Claude" if provider == "ClaudeCode" else ("Copilot" if provider == "CopilotCLI" else "Antigravity")
             btn = RoundedButton(
-                holder, f"↗ Open {name} sign-in terminal", command=lambda: self._open_cli(name),
+                holder, f"↗ Open {name} sign-in terminal", command=lambda: self._open_cli(name, ("auth",) if name == "Copilot" else ()),
                 bg_color=CARD, padx=10, pady=3, radius=6, font=SUB_FONT,
             )
             btn.pack(side="left")
@@ -1324,7 +1324,17 @@ class OmniApp:
 
     def _open_cli(self, name: str, args: tuple[str, ...] = ()) -> None:
         try:
-            runner.open_cli_sign_in(self.v_exe.get(), args)
+            exe = self.v_exe.get().strip()
+            if not exe:
+                if name == "Claude":
+                    exe = "claude"
+                elif name == "Copilot":
+                    exe = "copilot"
+                elif name == "OpenCode":
+                    exe = "opencode"
+                else:
+                    exe = "agy"
+            runner.open_cli_sign_in(exe, args)
             self._set_test_pill(None, f"Sign-in terminal opened for {name}.")
         except OSError as error:
             self._set_test_pill(False, str(error))

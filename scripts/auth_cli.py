@@ -177,12 +177,17 @@ def test_connection(cfg):
         except Exception:
             return {"ok": False, "message": "Not signed in to OpenCode. Click 'Sign In' or run 'opencode auth login'."}
 
-    elif provider in ("ClaudeCode", "AntigravityCLI"):
+    elif provider in ("ClaudeCode", "AntigravityCLI", "CopilotCLI"):
         import subprocess
-        cmd_name = executable or ("claude" if provider == "ClaudeCode" else "agy")
+        cmd_name = executable or ("claude" if provider == "ClaudeCode" else ("copilot" if provider == "CopilotCLI" else "agy"))
         try:
             res = subprocess.run([cmd_name, "--version"], capture_output=True, text=True, timeout=10)
             elapsed = int((time.time() - t0) * 1000)
+            if res.returncode != 0 and provider == "CopilotCLI" and not executable:
+                res_gh = subprocess.run(["gh", "copilot", "--version"], capture_output=True, text=True, timeout=10)
+                if res_gh.returncode == 0:
+                    cmd_name = "gh copilot"
+                    res = res_gh
             if res.returncode != 0:
                 return {"ok": False, "message": f"{cmd_name} returned code {res.returncode}: {res.stderr.strip()[:100]}"}
 
@@ -202,6 +207,8 @@ def test_connection(cfg):
                     pass
             elif provider == "ClaudeCode":
                 available_models = ["default", "claude-3-7-sonnet", "claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus"]
+            elif provider == "CopilotCLI":
+                available_models = ["default", "gpt-4o", "claude-3.5-sonnet", "o1"]
 
             return {
                 "ok": True,
@@ -209,6 +216,18 @@ def test_connection(cfg):
                 "available_models": available_models,
             }
         except Exception as exc:
+            if provider == "CopilotCLI" and not executable:
+                try:
+                    res_gh = subprocess.run(["gh", "--version"], capture_output=True, text=True, timeout=10)
+                    if res_gh.returncode == 0:
+                        ver = (res_gh.stdout.strip() or "").splitlines()[0]
+                        return {
+                            "ok": True,
+                            "message": f"GitHub CLI ready: {ver} ({int((time.time() - t0) * 1000)}ms)",
+                            "available_models": ["default", "gpt-4o", "claude-3.5-sonnet", "o1"],
+                        }
+                except Exception:
+                    pass
             return {"ok": False, "message": f"Could not run {cmd_name}: {exc}"}
 
     elif provider == "Anthropic":
@@ -259,8 +278,31 @@ def test_connection(cfg):
             return {"ok": False, "message": f"Anthropic error: {exc}"}
 
     else:
-        # OpenAI, DeepSeek, Ollama, LMStudio, OpenAICompatible
-        url = api_url.rstrip("/") or "https://api.openai.com/v1"
+        # OpenAI, DeepSeek, GoogleGemini, OpenRouter, Groq, Mistral, Ollama, LMStudio, OpenAICompatible
+        default_url_map = {
+            "OpenAI": "https://api.openai.com/v1",
+            "DeepSeek": "https://api.deepseek.com/v1",
+            "GoogleGemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "OpenRouter": "https://openrouter.ai/api/v1",
+            "Groq": "https://api.groq.com/openai/v1",
+            "Mistral": "https://api.mistral.ai/v1",
+            "Ollama": "http://localhost:11434/v1",
+            "LMStudio": "http://localhost:1234/v1",
+            "OpenAICompatible": "http://localhost:1234/v1",
+        }
+        default_probe_map = {
+            "OpenAI": "gpt-5.1",
+            "DeepSeek": "deepseek-chat",
+            "GoogleGemini": "gemini-2.0-flash",
+            "OpenRouter": "anthropic/claude-3.7-sonnet",
+            "Groq": "llama-3.3-70b-versatile",
+            "Mistral": "codestral-latest",
+            "Ollama": "llama3.2",
+            "LMStudio": "local-model",
+            "OpenAICompatible": "local-model",
+        }
+        fallback_url = default_url_map.get(provider, "https://api.openai.com/v1")
+        url = api_url.rstrip("/") or fallback_url
         base_url = url
         for suffix in ("/chat/completions", "/completions", "/models"):
             if base_url.endswith(suffix):
@@ -272,7 +314,7 @@ def test_connection(cfg):
 
         available_models = []
         model_endpoints = []
-        if base_url.endswith("/v1"):
+        if base_url.endswith("/v1") or base_url.endswith("/openai"):
             model_endpoints.append(f"{base_url}/models")
         else:
             model_endpoints.extend([f"{base_url}/v1/models", f"{base_url}/models"])
@@ -296,8 +338,8 @@ def test_connection(cfg):
             except Exception:
                 continue
 
-        req_url = f"{base_url}/chat/completions" if base_url.endswith("/v1") else f"{base_url}/v1/chat/completions"
-        probe_model = model or (available_models[0] if available_models else "gpt-5.1")
+        req_url = f"{base_url}/chat/completions" if (base_url.endswith("/v1") or base_url.endswith("/openai")) else f"{base_url}/v1/chat/completions"
+        probe_model = model or (available_models[0] if available_models else default_probe_map.get(provider, "gpt-4o"))
         body = {
             "model": probe_model,
             "messages": [{"role": "user", "content": "ping"}],

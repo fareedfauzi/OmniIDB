@@ -14,7 +14,7 @@ Batch reverse engineering and IDA database enrichment using AI.
 
 **OmniIDB** is a desktop GUI and headless batch runner for **Hex-Rays IDA Pro**. Instead of opening IDA files one by one, you point OmniIDB at a binary or a folder of samples. It runs IDA in headless mode, uses LLMs to rename `sub_*` functions and local variables, exports decompiled C workspaces, and saves the updated `.i64` databases.
 
-> **Note on Genesect**: This project is based on [Genesect](https://github.com/fareedfauzi/Genesect) by Fareed Fauzi. Where Genesect focuses on an interactive IDA Pro plugin for working inside IDA on a single sample, OmniIDB focuses on bulk batch jobs: feeding in multiple samples, running them unattended, and saving `original.i64` and `analyzed.i64` databases to disk.
+> **Note on Genesect**: This project is based on [Genesect](https://github.com/fareedfauzi/Genesect). Where Genesect focuses on an interactive IDA Pro plugin for working inside IDA on a single sample, OmniIDB focuses on bulk batch jobs: feeding in multiple samples, running them unattended, and saving `original.i64` and `analyzed.i64` databases to disk.
 
 ---
 
@@ -52,9 +52,9 @@ Batch reverse engineering and IDA database enrichment using AI.
 2. **IDA Pro 8.3+ or 9.x** with Hex-Rays decompiler (`idat.exe` or `ida.exe`).
 3. **Python 3.9+**.
 4. An AI provider:
-   - **Cloud API**: OpenAI, Anthropic, or DeepSeek API key.
+   - **Cloud API**: OpenAI, Anthropic, DeepSeek, Google Gemini, OpenRouter, Groq, or Mistral API key.
    - **Local LLM**: Ollama or LMStudio.
-   - **Signed-in CLI**: Antigravity CLI (`agy`), Claude Code (`claude`), OpenCode, or ChatGPT account.
+   - **Signed-in CLI**: GitHub Copilot CLI (`copilot` / `gh copilot`), Antigravity CLI (`agy`), Claude Code (`claude`), OpenCode, or ChatGPT account.
 
 ---
 
@@ -103,27 +103,32 @@ In the UI, you can pick and choose which tasks to run:
 
 | Option | What it does |
 | :--- | :--- |
-| **Rename sub_* functions** | Analyzes control flow, strings, and APIs to give `sub_*` routines descriptive names. |
+| **Rename sub_ functions** | Analyzes control flow, strings, and APIs to give `sub_*` routines descriptive names. |
 | **Rename variables & parameters** | Uses Hex-Rays to replace `v1`, `a1` with meaningful variable names. |
 | **Export AI workspace** | Dumps decompiled C code, imports, strings, and `AGENTS.md` into an offline folder. |
-| **↳ Proceed analysis of workspace** | Available for CLI agents (`agy`, `claude`, `opencode`). The agent reads the exported files and writes a technical report. |
+| **↳ Proceed analysis of workspace** | Available for CLI agents (`copilot`, `agy`, `claude`, `opencode`). The agent reads the exported files and writes a technical report. |
 | **Autonomous Investigation** | Multi-turn agent loop (3–30 turns) that inspects IDA memory and outputs HTML, PDF, and MD reports. |
 
 ---
 
 ## Supported AI Providers
 
-OmniIDB supports 10 backends:
+OmniIDB supports 15 backends:
 
 | Provider | Setup | Model Discovery |
 | :--- | :--- | :--- |
 | **OpenAI** | API Key (`sk-...`) | Auto-fetches via `/v1/models` |
 | **Anthropic** | API Key (`sk-ant-...`) | Auto-fetches via `/v1/models` |
 | **DeepSeek** | API Key (`sk-...`) | Auto-fetches via `/v1/models` |
+| **GoogleGemini** | API Key (`AIza...`) | Auto-fetches Gemini 2.5/2.0/1.5 via Google AI Studio |
+| **OpenRouter** | API Key (`sk-or-...`) | Auto-fetches all aggregator models via OpenRouter |
+| **Groq** | API Key (`gsk_...`) | Auto-fetches high-speed Llama & Mixtral models |
+| **Mistral** | API Key (`...`) | Auto-fetches Mistral & Codestral models |
 | **OpenAICompatible** | URL + optional key | Auto-fetches via `/v1/models` |
 | **Ollama** | Local (default `localhost:11434`) | Auto-fetches tags |
 | **LMStudio** | Local (default `localhost:1234`) | Auto-fetches models |
 | **ChatGPTAccount** | Browser login (OAuth) | Auto-detects models |
+| **CopilotCLI** | Local `copilot` or `gh copilot` | Auto-detects Copilot models |
 | **AntigravityCLI** | Local `agy` CLI | Auto-fetches `agy models` |
 | **ClaudeCode** | Local `claude` CLI | Claude 3.5 / 3.7 models |
 | **OpenCode** | Local `opencode` CLI | Reads configured providers |
@@ -175,7 +180,7 @@ C:\Output\sample.exe-a1b2c3d4\
 
 ## Relationship to Genesect
 
-OmniIDB is based on [Genesect](https://github.com/fareedfauzi/Genesect) by **Fareed Fauzi**.
+OmniIDB is based on [Genesect](https://github.com/fareedfauzi/Genesect).
 
 - **Genesect** is an **in-IDA plugin**: you open IDA, click functions, and chat with the AI helper interactively while analyzing a single binary.
 - **OmniIDB** is a **batch queue tool**: you give it a list of files or a sample folder, it runs IDA in the background, updates the databases, exports workspaces, and writes reports without you having to click through IDA manually.

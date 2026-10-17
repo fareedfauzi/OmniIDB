@@ -13,6 +13,10 @@ PROVIDERS = [
     "OpenAI",
     "Anthropic",
     "DeepSeek",
+    "GoogleGemini",
+    "OpenRouter",
+    "Groq",
+    "Mistral",
     "OpenAICompatible",
     "Ollama",
     "LMStudio",
@@ -20,16 +24,21 @@ PROVIDERS = [
     "ClaudeCode",
     "AntigravityCLI",
     "OpenCode",
+    "CopilotCLI",
 ]
 
-SIGNED_IN_PROVIDERS = {"ChatGPTAccount", "ClaudeCode", "AntigravityCLI", "OpenCode"}
-CLI_PROVIDERS = ("ClaudeCode", "AntigravityCLI", "OpenCode")
+SIGNED_IN_PROVIDERS = {"ChatGPTAccount", "ClaudeCode", "AntigravityCLI", "OpenCode", "CopilotCLI"}
+CLI_PROVIDERS = ("ClaudeCode", "AntigravityCLI", "OpenCode", "CopilotCLI")
 KEYLESS_PROVIDERS = {"Ollama", "LMStudio"}
 
 # provider -> (api_url, model, executable)
 _PROVIDER_DEFAULTS = {
     "Anthropic": ("https://api.anthropic.com", "claude-sonnet-4-5", ""),
     "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat", ""),
+    "GoogleGemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash", ""),
+    "OpenRouter": ("https://openrouter.ai/api/v1", "anthropic/claude-3.7-sonnet", ""),
+    "Groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", ""),
+    "Mistral": ("https://api.mistral.ai/v1", "codestral-latest", ""),
     "OpenAICompatible": ("http://localhost:1234/v1", "local-model", ""),
     "Ollama": ("http://localhost:11434/v1", "llama3.2", ""),
     "LMStudio": ("http://localhost:1234/v1", "local-model", ""),
@@ -37,12 +46,17 @@ _PROVIDER_DEFAULTS = {
     "ClaudeCode": ("", "default", "claude"),
     "AntigravityCLI": ("", "default", "agy"),
     "OpenCode": ("", "default", "opencode"),
+    "CopilotCLI": ("", "default", "copilot"),
 }
 
 DEFAULT_PROVIDER_MODELS = {
     "OpenAI": ["gpt-5.1", "gpt-4o", "gpt-4o-mini", "o3-mini", "o1"],
     "Anthropic": ["claude-sonnet-4-5", "claude-3-7-sonnet-latest", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"],
     "DeepSeek": ["deepseek-chat", "deepseek-reasoner"],
+    "GoogleGemini": ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash"],
+    "OpenRouter": ["anthropic/claude-3.7-sonnet", "deepseek/deepseek-r1", "openai/gpt-4o", "meta-llama/llama-3.3-70b-instruct", "qwen/qwen-2.5-coder-32b-instruct"],
+    "Groq": ["llama-3.3-70b-versatile", "deepseek-r1-distill-llama-70b", "qwen-2.5-coder-32b", "llama-3.1-8b-instant"],
+    "Mistral": ["codestral-latest", "mistral-large-latest", "mistral-small-latest", "ministral-8b-latest"],
     "OpenAICompatible": ["local-model"],
     "Ollama": ["llama3.2", "llama3.1", "qwen2.5-coder", "deepseek-r1"],
     "LMStudio": ["local-model"],
@@ -57,6 +71,7 @@ DEFAULT_PROVIDER_MODELS = {
         "gpt-oss-120b-medium",
     ],
     "OpenCode": ["default", "openai/gpt-4o", "anthropic/claude-3-5-sonnet"],
+    "CopilotCLI": ["default", "gpt-4o", "claude-3.5-sonnet", "o1"],
 }
 
 
