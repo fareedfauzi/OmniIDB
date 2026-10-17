@@ -422,6 +422,272 @@ def pre_process_go_symbols(sample_path, goresym_path=""):
     return renamed
 
 
+def detect_sample_language():
+    """Detect if the current IDB represents a Go or Rust binary using symbols or strings."""
+    import idautils
+    import idc
+    from omni_idb import rust_support as rs
+    from omni_idb import go_support as gs
+
+    func_names = []
+    for i, ea in enumerate(idautils.Functions()):
+        name = idc.get_func_name(ea) or ""
+        if name:
+            func_names.append(name)
+        if i >= 5000:
+            break
+
+    for name in func_names:
+        if rs.looks_like_rust_mangled(name):
+            return "Rust"
+        if "." in name and not name.startswith(gs.IDA_PREFIXES):
+            pkg_info = gs.classify_go_symbol(name)
+            if pkg_info:
+                return "Go"
+
+    sample_strings = []
+    try:
+        strings = idautils.Strings()
+        strings.setup(strtypes=getattr(idautils.Strings, "STR_C", 0))
+    except Exception:
+        strings = idautils.Strings()
+    for item in strings:
+        try:
+            text = str(item)
+            if text:
+                sample_strings.append(text)
+        except Exception:
+            continue
+        if len(sample_strings) >= 4000:
+            break
+
+    rust_triage = rs.detect_rust_confidence(sample_strings, func_names)
+    if rust_triage.get("is_rust"):
+        return "Rust"
+
+    go_triage = gs.detect_go_confidence(sample_strings, func_names)
+    if go_triage.get("is_go"):
+        return "Go"
+
+    return None
+
+
+def detect_protectors_and_packers():
+    """Comprehensively detect code virtualization, commercial protectors, packers, and obfuscators."""
+    import math
+    from collections import Counter
+    import ida_bytes
+    import ida_segment
+    import idautils
+
+    findings = []
+    seg_names = []
+    high_entropy_segs = []
+
+    def calc_entropy(data: bytes) -> float:
+        if not data:
+            return 0.0
+        counts = Counter(data)
+        total = len(data)
+        return -sum((n / total) * math.log2(n / total) for n in counts.values())
+
+    for start in idautils.Segments():
+        seg = ida_segment.getseg(start)
+        if not seg:
+            continue
+        name = (ida_segment.get_segm_name(seg) or "").lower()
+        seg_names.append(name)
+        size = int(seg.end_ea) - int(seg.start_ea)
+        if size > 4096:
+            sample_size = min(size, 65536)
+            buf = ida_bytes.get_bytes(int(seg.start_ea), sample_size)
+            if buf:
+                ent = calc_entropy(buf)
+                if ent >= 7.2:
+                    high_entropy_segs.append((name, ent, size))
+
+    sample_strings = []
+    try:
+        strings = idautils.Strings()
+        strings.setup(strtypes=getattr(idautils.Strings, "STR_C", 0))
+    except Exception:
+        strings = idautils.Strings()
+    for item in strings:
+        try:
+            s = str(item).lower()
+            if s:
+                sample_strings.append(s)
+        except Exception:
+            continue
+        if len(sample_strings) >= 2000:
+            break
+
+    # 1. Code Virtualizers & Heavy Commercial Protectors
+    virtualizers = [
+        ("VMProtect", (".vmp0", ".vmp1", ".vmp2", "vmp0", "vmp1", "vmp2"), ("vmprotect",)),
+        ("Themida / WinLicense", (".themida", "themida", ".winlicense", "winlicense", ".wl", ".oreans"), ("themida", "winlicense", "oreans")),
+        ("Enigma Protector", (".enigma1", ".enigma2", "enigma1", "enigma2", ".enigma"), ("enigma protector",)),
+        ("Obsidium", (".obsid", "obsid", ".obsidium"), ("obsidium",)),
+        ("Code Virtualizer", (".cvirtual", ".virtual"), ("code virtualizer",)),
+        ("Safengine / Shielden", (".shield", ".secur", "safengine", ".pedb"), ("safengine", "shielden")),
+        ("StarForce", (".sforce", ".peloader"), ("starforce",)),
+        ("Denuvo", (".denuvo",), ("denuvo",)),
+        ("KoiVM", ("koivm",), ("koivm",)),
+    ]
+
+    for name, sec_markers, str_markers in virtualizers:
+        hit_secs = [s for s in seg_names if any(m in s for m in sec_markers)]
+        hit_strs = [m for m in str_markers if any(m in s for s in sample_strings)]
+        if hit_secs or hit_strs:
+            detail = ("sections: %s" % ", ".join(hit_secs)) if hit_secs else ("string: '%s'" % hit_strs[0])
+            findings.append(("Code Virtualization", "%s (%s)" % (name, detail)))
+            break
+
+    # 2. Known Native Packers & Crypter Stubs
+    packers = [
+        ("UPX", (".upx", "upx0", "upx1", "upx2", "upx!"), ("upx!",)),
+        ("ASPack", (".aspack", "aspack", ".adata"), ("aspack",)),
+        ("MPRESS", (".mpress", "mpress1", "mpress2"), ("mpress",)),
+        ("PECompact", ("pec1", "pec2", "pecompact2", ".pec"), ("pecompact",)),
+        ("FSG", ("fsg!", "fsga", "fsg"), ()),
+        ("NSPack", (".nsp0", ".nsp1", ".nsp2", "nsp0", "nsp1"), ()),
+        ("MEW", ("mew", ".mew"), ()),
+        ("Petite", (".petite", "petite"), ("petite",)),
+        ("Yoda's Protector", (".yp", ".yoda", "yoda"), ()),
+        ("Morphine", (".morph", "morphine"), ()),
+        ("Telock", (".telock", "telock"), ()),
+        ("Armadillo", (".armidr", "armadillo"), ("armadillo",)),
+        ("ASProtect", (".aspr", ".asprot", "asprotect"), ("asprotect",)),
+        ("ExeStealth", (".stealth", "stealth"), ()),
+        ("eXPressor", (".express", "expressor"), ()),
+        ("Packman", (".packman",), ()),
+        ("RLPack", (".rlp", "rlpack"), ()),
+        ("Molebox", (".box", "molebox"), ()),
+        ("kkrunchy", ("kkrunchy",), ()),
+        ("UPack", (".upack", "upack"), ()),
+        ("Neolite", (".neolite", "neolite"), ()),
+        ("SVK Protector", (".svk", "svk"), ()),
+        ("ExeCryptor", (".excrypt", "execryptor"), ()),
+        ("WWPACK", (".wwpack", "wwpack"), ()),
+        ("Generic Crypter Stub", (".stub", ".crypt", ".crypted", ".crp", ".enc", ".payload"), ()),
+    ]
+
+    if not any(f[0] == "Code Virtualization" for f in findings):
+        for name, sec_markers, str_markers in packers:
+            hit_secs = [s for s in seg_names if any(m in s for m in sec_markers)]
+            hit_strs = [m for m in str_markers if any(m in s for s in sample_strings)]
+            if hit_secs or hit_strs:
+                detail = ("sections: %s" % ", ".join(hit_secs)) if hit_secs else ("string: '%s'" % hit_strs[0])
+                findings.append(("Packed", "%s (%s)" % (name, detail)))
+                break
+
+    # 3. .NET Obfuscators & Protectors
+    dotnet_obfuscators = [
+        ("ConfuserEx", ("confuserex", "confuser.core", "confusedbyattribute")),
+        ("Eazfuscator.NET", ("eazfuscator",)),
+        ("SmartAssembly", ("smartassembly", "poweredbyattribute")),
+        (".NET Reactor", (".net reactor", "dotnetpaging")),
+        ("Agile.NET", ("agile.net", "clisecure")),
+        ("Crypto Obfuscator", ("cryptoobfuscator",)),
+        ("Babel .NET", ("babel.net", "babelattribute")),
+        ("DeepSea Obfuscator", ("deepsea",)),
+        ("Goliath.NET", ("goliath.net",)),
+    ]
+
+    for name, str_markers in dotnet_obfuscators:
+        hit_strs = [m for m in str_markers if any(m in s for s in sample_strings)]
+        if hit_strs:
+            findings.append(("Obfuscated .NET", "%s (detected '%s')" % (name, hit_strs[0])))
+            break
+
+    # 4. Fallback to Shannon Entropy if no specific signature matched
+    if not findings and high_entropy_segs:
+        highest = max(high_entropy_segs, key=lambda s: s[1])
+        findings.append(("Packed / High Entropy", "Section '%s' entropy %.2f (size %d bytes)" % (highest[0], highest[1], highest[2])))
+
+    return findings
+
+
+IGNORE_CALL_LIST = {
+    "rtlntstatustodoserror", "getlasterror", "setlasterror", "rtlgetlastwin32error",
+    "rtlsetlastwin32error", "gettickcount", "gettickcount64", "queryperformancecounter",
+    "queryperformancefrequency", "rtlzeromemory", "rtlfillmemory", "rtlcomparememory",
+    "memset", "memcpy", "memmove", "memcmp", "strlen", "strcpy", "strcat", "strcmp",
+    "strncmp", "sprintf", "vsprintf", "printf", "malloc", "free", "realloc", "calloc",
+    "entercriticalsection", "leavecriticalsection", "initializecriticalsection",
+    "deletecriticalsection", "sleep", "closehandle", "getcurrentprocess",
+    "getcurrentthread", "getcurrentprocessid", "getcurrentthreadid", "abort",
+}
+
+
+def filter_high_signal_sub_functions(sub_functions, renamer, max_ceiling=150):
+    """Filter and rank sub_* functions for Go/Rust binaries based on API taxonomy & triage signals.
+
+    Instead of an arbitrary small limit that might cut off legitimate capabilities,
+    this includes all functions with observable behavioral signals (network, crypto,
+    injection, stealer, persistence, commands, URLs, IPs, registry) while skipping
+    the thousands of zero-signal compiler runtime and memory allocation functions.
+    """
+    from omni_idb import classify as cl
+
+    scored = []
+    zero_signal = []
+
+    for ea, name in sub_functions:
+        calls = renamer.get_calls_fast(ea) if hasattr(renamer, "get_calls_fast") else []
+        strings = renamer.get_strings_fast(ea) if hasattr(renamer, "get_strings_fast") else []
+
+        score = 0
+
+        # 1. API Taxonomy & Capabilities (ignoring common runtime/utility noise)
+        for call_name in calls:
+            clean = cl.normalize_import(call_name).lower()
+            if clean in IGNORE_CALL_LIST:
+                continue
+            caps = cl.capabilities_of_import(call_name)
+            for cap in caps:
+                if cap in ("injection", "stealer", "persistence", "lateral", "driver"):
+                    score += 4
+                elif cap in ("dynamic_resolve", "crypto", "network", "anti_debug", "resource"):
+                    score += 3
+                elif cap in ("process", "registry", "input_capture", "discovery"):
+                    score += 2
+                elif cap in ("file", "memory", "service", "compression"):
+                    score += 1
+
+        # 2. String Triage (commands, URLs, IPs, registry, LOLBins, persistence)
+        for s in strings:
+            cats = cl.classify_string(s)
+            for cat in cats:
+                if cat in ("command", "stealer_target", "persistence", "device_driver"):
+                    score += 3
+                elif cat in ("url", "ip", "domain", "named_pipe"):
+                    score += 2
+                elif cat in ("registry", "base64_alphabet"):
+                    score += 1
+
+        # 3. Call Centrality / Fan-out bonus (functions orchestrating multiple external calls)
+        valid_calls = [c for c in calls if cl.normalize_import(c).lower() not in IGNORE_CALL_LIST]
+        if len(valid_calls) >= 3:
+            score += min(len(valid_calls) // 2, 4)
+
+        if score > 0:
+            scored.append((score, len(calls), len(strings), ea, name))
+        else:
+            zero_signal.append((len(calls), len(strings), ea, name))
+
+    if scored:
+        # Sort descending by score, then calls, then strings
+        scored.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+        selected = scored[:max_ceiling]
+        return [(item[3], item[4]) for item in selected]
+
+    # Fallback if no functions scored > 0: take top 25 with highest activity
+    zero_signal.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    fallback = zero_signal[:25]
+    return [(item[2], item[3]) for item in fallback]
+
+
 def collect_sub_functions(renamer):
     import idautils
     import idc
@@ -1442,6 +1708,7 @@ def run_workspace_analysis(job, cfg, renamer, workspace_path):
         "- Prioritize readability without sacrificing technical accuracy.\n\n"
         "## 2. Technical Content\n"
         "- Focus on what the malware does, how it operates, and why its behaviour matters.\n"
+        "- If the sample is packed, encrypted, uses code virtualization (VMProtect/Themida), or acts as a crypter/shellcode loader: clearly state this. Document what the packer stub, shellcode, crypter, and process injection actually DO (execution flow, APIs called, memory allocations, and targeted processes) based strictly on observable evidence, without speculating on unextracted payloads.\n"
         "- Explain relevant mechanisms without documenting every function, API parameter, variable, or memory address.\n"
         "- Include technical details such as APIs, commands, file paths, and registry keys only when they contribute to understanding the malware.\n"
         "- Exclude compiler-generated code, runtime initialization, and irrelevant implementation details.\n"
@@ -1555,17 +1822,42 @@ def main():
     install_provider_adapter(CONFIG, cfg, renamer, var_renamer, repo_root, job)
 
     # Demangle or recover Rust / Go symbols before building call graph and rename queue
+    rust_detected = False
+    go_detected = False
+
     try:
-        pre_process_rust_symbols()
+        if pre_process_rust_symbols() > 0:
+            rust_detected = True
     except Exception as exc:
         emit("log", "Rust symbol pre-processing skipped: %s" % exc, level="warning")
 
     try:
         sample_file = job.get("sample_path", "")
         if sample_file:
-            pre_process_go_symbols(sample_file, job.get("goresym_path", ""))
+            if pre_process_go_symbols(sample_file, job.get("goresym_path", "")) > 0:
+                go_detected = True
     except Exception as exc:
         emit("log", "Go symbol pre-processing skipped: %s" % exc, level="warning")
+
+    detected_lang = None
+    if rust_detected:
+        detected_lang = "Rust"
+    elif go_detected:
+        detected_lang = "Go"
+    else:
+        try:
+            detected_lang = detect_sample_language()
+        except Exception as exc:
+            emit("log", "Sample language detection check encountered error: %s" % exc, level="warning")
+
+    # Detect packers, code virtualization, and protectors
+    protections = []
+    try:
+        protections = detect_protectors_and_packers()
+        for kind, detail in protections:
+            emit("log", "[!] Detected %s: %s" % (kind, detail), level="warning")
+    except Exception as exc:
+        emit("log", "Protector detection check skipped: %s" % exc, level="warning")
 
     emit("stage", "Scanning functions", stage="scan")
     sub_functions = collect_sub_functions(renamer)
@@ -1575,15 +1867,86 @@ def main():
         "idb_path": job.get("idb_path"),
         "original_idb_path": original_idb,
         "workspace_path": "",
+        "protections": protections,
         "function_rename": None,
         "variable_rename": None,
         "autonomous_investigation": None,
     }
 
+    is_virtualized = any(kind == "Code Virtualization" for kind, _ in protections)
+    is_packed = any("Packed" in kind for kind, _ in protections)
+    is_obfuscated_dotnet = any(kind == "Obfuscated .NET" for kind, _ in protections)
+
     if job.get("rename_functions"):
-        result["function_rename"] = run_function_rename(sub_functions, cfg, renamer, cache=cache, tracker=tracker)
+        if is_virtualized or is_obfuscated_dotnet:
+            reason = "Code Virtualization" if is_virtualized else "Obfuscated .NET"
+            emit(
+                "log",
+                "[*] %s detected: auto-skipping function renaming to avoid token waste on obfuscated handlers." % reason,
+                level="ok",
+            )
+            result["function_rename"] = {
+                "renamed": 0,
+                "skipped": True,
+                "reason": "Auto-skipped for %s" % reason,
+            }
+        else:
+            if detected_lang in ("Go", "Rust") and len(sub_functions) > 100:
+                emit(
+                    "log",
+                    "[*] Detected %s binary with %d sub_* functions; running behavioral triage filtering..."
+                    % (detected_lang, len(sub_functions)),
+                    level="info",
+                )
+                filtered_subs = filter_high_signal_sub_functions(sub_functions, renamer, max_ceiling=150)
+                skipped_count = len(sub_functions) - len(filtered_subs)
+                emit(
+                    "log",
+                    "[*] Prioritized %d high-signal functions (skipped %d zero-signal runtime/allocator functions) to conserve tokens."
+                    % (len(filtered_subs), skipped_count),
+                    level="ok",
+                )
+                sub_functions = filtered_subs
+            elif is_packed and len(sub_functions) > 25:
+                emit(
+                    "log",
+                    "[*] Packed binary detected with %d sub_* functions; prioritizing top high-signal stub functions..."
+                    % len(sub_functions),
+                    level="info",
+                )
+                filtered_subs = filter_high_signal_sub_functions(sub_functions, renamer, max_ceiling=25)
+                sub_functions = filtered_subs
+
+            result["function_rename"] = run_function_rename(sub_functions, cfg, renamer, cache=cache, tracker=tracker)
+
     if job.get("rename_variables"):
-        result["variable_rename"] = run_variable_rename(sub_functions, cfg, var_renamer, cache=cache, tracker=tracker)
+        if is_virtualized or is_packed or is_obfuscated_dotnet:
+            reason = "Code Virtualization" if is_virtualized else ("Packed binary" if is_packed else "Obfuscated .NET")
+            emit(
+                "log",
+                "[*] %s detected: auto-skipping variable rename to avoid token waste on decompiler temporaries." % reason,
+                level="ok",
+            )
+            result["variable_rename"] = {
+                "functions_changed": 0,
+                "variables_renamed": 0,
+                "skipped": True,
+                "reason": "Auto-skipped for %s" % reason,
+            }
+        elif detected_lang in ("Go", "Rust"):
+            emit(
+                "log",
+                "[*] Detected %s binary: auto-skipping variable rename to conserve tokens and avoid runtime noise." % detected_lang,
+                level="ok",
+            )
+            result["variable_rename"] = {
+                "functions_changed": 0,
+                "variables_renamed": 0,
+                "skipped": True,
+                "reason": "Auto-skipped for %s binary (token conservation)" % detected_lang,
+            }
+        else:
+            result["variable_rename"] = run_variable_rename(sub_functions, cfg, var_renamer, cache=cache, tracker=tracker)
     if job.get("autonomous_investigation"):
         result["autonomous_investigation"] = run_autonomous_investigation(job, cfg, renamer)
     if job.get("autonomous_investigation") and job.get("report_dir"):

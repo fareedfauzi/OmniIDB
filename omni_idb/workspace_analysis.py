@@ -26,7 +26,10 @@ def _analysis_prompt(workspace: Path) -> str:
         f"Analyze the exported reverse-engineering workspace at {workspace}. Inspect its C# or C/C++ source, "
         "IL/disassembly, metadata catalogs, imports, strings, resources, and agent guidance. Write a cohesive "
         "malware research report covering execution flow, capabilities, configuration and infrastructure, "
-        "persistence/evasion where supported, notable implementation details, IOCs, uncertainty, and next steps."
+        "persistence/evasion where supported, notable implementation details, IOCs, uncertainty, and next steps. "
+        "If the sample is packed, encrypted, uses code virtualization (VMProtect/Themida), or acts as a crypter/shellcode loader, "
+        "clearly state this and document what the loader/packer stub and process injection actually do based strictly on observable evidence, "
+        "without speculating on unextracted payloads."
     )
 
 

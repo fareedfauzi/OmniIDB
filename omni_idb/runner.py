@@ -464,8 +464,12 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
 
     result = json.loads(result_path.read_text(encoding="utf-8"))
     renamed = _dig(result, "function_rename", "renamed") or 0
+    fn_skipped = _dig(result, "function_rename", "skipped")
+    fn_text = "funcs: skipped" if fn_skipped else f"{renamed} functions"
     variables = _dig(result, "variable_rename", "variables_renamed") or 0
-    parts = [f"{renamed} functions", f"{variables} variables"]
+    var_skipped = _dig(result, "variable_rename", "skipped")
+    var_text = "vars: skipped" if var_skipped else f"{variables} variables"
+    parts = [fn_text, var_text]
     fn_cache_hits = _dig(result, "function_rename", "cache_hits") or 0
     var_cache_hits = _dig(result, "variable_rename", "cache_hits") or 0
     total_cache_hits = fn_cache_hits + var_cache_hits

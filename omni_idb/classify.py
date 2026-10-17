@@ -125,25 +125,37 @@ _CAPABILITY_PATTERNS = {
     ),
     "injection": _compile(
         ["virtualallocex", "writeprocessmemory", "readprocessmemory", "createremotethread",
-         "ntcreatethreadex", "rtlcreateuserthread", "queueuserapc", "ntqueueapcthread",
-         "setthreadcontext", "wow64setthreadcontext", "ntunmapviewofsection",
-         "zwunmapviewofsection", "ntmapviewofsection", "ntwritevirtualmemory",
-         "ntallocatevirtualmemory", "ntprotectvirtualmemory", "openprocess", "suspendthread",
-         "resumethread", "ntresumethread", "createprocessinternal",
-         "ntcreatesection", "ntopenprocess"],
+         "createremotethreadex", "ntcreatethreadex", "zwcreatethreadex", "rtlcreateuserthread",
+         "queueuserapc", "ntqueueapcthread", "ntqueueapcthreadex", "zwqueueapcthread",
+         "setthreadcontext", "wow64setthreadcontext", "ntsetcontextthread", "zwsetcontextthread",
+         "ntgetcontextthread", "zwgetcontextthread", "ntunmapviewofsection",
+         "zwunmapviewofsection", "ntmapviewofsection", "zwmapviewofsection", "ntwritevirtualmemory",
+         "zwwritevirtualmemory", "ntallocatevirtualmemory", "zwallocatevirtualmemory",
+         "ntprotectvirtualmemory", "zwprotectvirtualmemory", "openprocess", "ntopenprocess",
+         "zwopenprocess", "suspendthread", "resumethread", "ntresumethread", "zwresumethread",
+         "createprocessinternal", "createprocessinternalw", "createprocessinternala",
+         "ntcreatesection", "zwcreatesection", "ntcreateuserprocess", "zwcreateuserprocess",
+         "ntcreatetransaction"],
+        [r"nt.*thread\w*", r"zw.*thread\w*", r"nt.*section\w*", r"zw.*section\w*"],
     ),
     "anti_debug": _compile(
         ["isdebuggerpresent", "checkremotedebuggerpresent", "ntqueryinformationprocess",
-         "zwqueryinformationprocess", "ntsetinformationthread", "debugactiveprocess",
-         "outputdebugstring", "ntquerysysteminformation", "blockinput"],
+         "zwqueryinformationprocess", "ntsetinformationthread", "zwsetinformationthread",
+         "debugactiveprocess", "outputdebugstring", "ntquerysysteminformation",
+         "zwquerysysteminformation", "blockinput", "ntdelayexecution", "zwdelayexecution"],
     ),
     "dynamic_resolve": _compile(
-        ["getprocaddress", "ldrgetprocedureaddress", "loadlibrary", "ldrloaddll",
-         "getmodulehandle", "dlsym", "dlopen"],
+        ["getprocaddress", "ldrgetprocedureaddress", "loadlibrary", "loadlibraryex",
+         "ldrloaddll", "getmodulehandle", "getmodulehandleex", "dlsym", "dlopen", "freelibrary"],
     ),
     "memory": _compile(
-        ["virtualalloc", "virtualprotect", "virtualprotectex", "virtualfree", "heapcreate",
-         "heapalloc", "mmap", "mprotect"],
+        ["virtualalloc", "virtualalloc2", "virtualprotect", "virtualprotectex",
+         "virtualprotectfromapp", "virtualfree", "ntfreevirtualmemory", "zwfreevirtualmemory",
+         "heapcreate", "heapalloc", "mmap", "mprotect"],
+    ),
+    "resource": _compile(
+        ["findresource", "findresourceex", "loadresource", "lockresource", "sizeofresource"],
+        [r"findresource\w*"],
     ),
     "stealer": _compile(
         ["cryptunprotectdata", "openclipboard", "getclipboarddata", "getasynckeystate",
@@ -200,9 +212,10 @@ _CAPABILITY_PATTERNS = {
     "process": _compile(
         ["createprocess", "createprocessasuser", "createprocesswithlogon", "winexec",
          "shellexecute", "system", "popen", "execve", "execl", "fork", "terminateprocess",
-         "createtoolhelp32snapshot", "process32first", "process32next", "enumprocesses",
-         "openprocesstoken", "adjusttokenprivileges", "lookupprivilegevalue",
-         "impersonateloggedonuser", "duplicatetoken", "createmutex", "openmutex"],
+         "createtoolhelp32snapshot", "process32first", "process32next", "thread32first",
+         "thread32next", "enumprocesses", "enumprocessmodules", "openprocesstoken",
+         "adjusttokenprivileges", "lookupprivilegevalue", "impersonateloggedonuser",
+         "duplicatetoken", "duplicatehandle", "ntduplicateobject", "createmutex", "openmutex"],
     ),
     "system_info": _compile(
         ["getcomputername", "getusername", "getsysteminfo", "getnativesysteminfo",
@@ -230,6 +243,7 @@ CAPABILITY_MODULE = {
     "anti_debug": (MODULE_EVASION, 2.0),
     "dynamic_resolve": (MODULE_EVASION, 2.0),
     "memory": (MODULE_EVASION, 0.5),
+    "resource": (MODULE_EVASION, 2.0),
     "stealer": (MODULE_STEALER, 3.0),
     "input_capture": (MODULE_STEALER, 3.0),
     "persistence": (MODULE_PERSISTENCE, 3.0),
@@ -533,6 +547,8 @@ def triage_signals(capabilities: Iterable[str], signals: dict, string_categories
         if signals.get("resolved_apis"):
             detail += ": " + ", ".join(signals["resolved_apis"][:8])
         add("dynamic_api_resolution", detail, 3)
+    if "resource" in caps:
+        add("payload_resource_apis", "calls PE resource extraction APIs (crypter / payload staging)", 2)
     if "network" in caps:
         add("network_apis", "calls networking APIs", 2)
     if "crypto" in caps:
