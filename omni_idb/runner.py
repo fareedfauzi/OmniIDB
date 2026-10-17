@@ -228,7 +228,6 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
     workspace = output_root / "AI Workspace"
     report_dir = output_root / "report"
     logs = output_root / "logs"
-    idb_dir.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
     idb_path = idb_dir / "analyzed.i64"
     original_idb_path = idb_dir / "original.i64"
@@ -238,7 +237,23 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
 
     # .NET Assembly special handling (does not require IDA Pro)
     if sample.kind == SampleKind.DOTNET_ASSEMBLY:
+        # Older versions created this native-only directory before branching.
+        # Remove it only when empty so a managed run never displays a fake IDB deliverable.
+        try:
+            idb_dir.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
         dotnet_mode = getattr(settings, "dotnet_mode", "skip")
+        should_analyze_workspace = settings.analyze_workspace
+
+        # If user selected In-Database Agent Analysis, IDA cannot decompile .NET CIL bytecode.
+        # Automatically fallback to Decompile & AI Workspace Analysis so the user still gets a full report.
+        if settings.autonomous_investigation:
+            if dotnet_mode == "skip":
+                dotnet_mode = "decompile"
+                _post(q, "log", message=f"[*] In-Database Agent Analysis does not apply to managed .NET ({sample.path.name}). Auto-falling back to Decompile & AI Workspace Analysis.")
+            should_analyze_workspace = True
+
         if dotnet_mode == "skip":
             _post(q, "sample_status", index=index, status="Skipped (.NET)")
             _post(q, "sample_stage", index=index, stage="Skipped")
@@ -259,7 +274,43 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
                 "pinvokes_count": ws_meta.get("pinvokes_count", 0),
                 "strings_count": ws_meta.get("strings_count", 0),
                 "cs_count": ws_meta.get("cs_count", 0),
+                "cil_count": ws_meta.get("cil_count", 0),
             }
+            if should_analyze_workspace:
+                _post(q, "sample_status", index=index, status="Analyzing .NET Workspace")
+                _post(q, "sample_stage", index=index, stage="Analyzing AI Workspace")
+                from .workspace_analysis import analyze_workspace
+
+                analysis = analyze_workspace(
+                    ws_meta["workspace_dir"],
+                    {
+                        "provider": settings.provider,
+                        "api_url": settings.api_url,
+                        "api_key": request.api_key,
+                        "model": settings.model,
+                        "executable": settings.executable,
+                    },
+                    {
+                        "provider": settings.fallback_provider,
+                        "api_url": settings.fallback_api_url,
+                        "api_key": request.fallback_api_key,
+                        "model": settings.fallback_model,
+                        "executable": settings.fallback_executable,
+                    } if settings.fallback_enabled else None,
+                    genesect_root=settings.genesect_root,
+                    ida_path=settings.ida_path,
+                    token_budget=remaining_budget or 0,
+                    log_fn=lambda message: _post(q, "log", message=message),
+                    cancel_checker=cancelled.is_set,
+                )
+                res["workspace_analysis_report"] = analysis["report_path"]
+                res["provider"] = {
+                    "primary": settings.provider,
+                    "active": analysis["provider"],
+                    "used": list(dict.fromkeys([settings.provider, analysis["provider"]])),
+                    "fallback_events": analysis["fallback_events"],
+                }
+                res["usage"] = analysis["usage"]
             result_path.write_text(json.dumps(res, indent=2), encoding="utf-8")
             parts = [
                 f"{res['types_count']} types",
@@ -268,8 +319,11 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
             ]
             if res["cs_count"] > 0:
                 parts.append(f"{res['cs_count']} C# files")
-            return f"Exported .NET AI Workspace ({', '.join(parts)})", res
+            if res.get("workspace_analysis_report"):
+                parts.append("workspace analysis: done")
+            return f"Completed .NET AI Workspace ({', '.join(parts)})", res
 
+    idb_dir.mkdir(parents=True, exist_ok=True)
     ida = Path(settings.ida_path.strip())
     if not ida.is_file():
         raise FileNotFoundError(f"IDA executable not found: {ida}")

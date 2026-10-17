@@ -106,7 +106,7 @@ In the UI, you can pick and choose which tasks to run:
 | **Rename sub_ functions** | Analyzes control flow, strings, and APIs to give `sub_*` routines descriptive names. |
 | **Rename variables & parameters** | Uses Hex-Rays to replace `v1`, `a1` with meaningful variable names. |
 | **Export AI workspace** | Dumps decompiled C code, imports, strings, and `AGENTS.md` into an offline folder. |
-| **↳ Proceed analysis of workspace** | Available for CLI agents (`copilot`, `agy`, `claude`, `opencode`). The agent reads the exported files and writes a technical report. |
+| **Exported Workspace AI Analysis** | CLI agents inspect exported files directly. ChatGPT Account and API providers receive a bounded source/catalog evidence bundle. All modes write a Markdown report and honor primary-first fallback. |
 | **Autonomous Investigation** | Multi-turn agent loop (3–30 turns) that inspects IDA memory and outputs HTML, PDF, and MD reports. |
 
 ---
@@ -146,6 +146,7 @@ If your primary API provider hits rate limits or token limits, check **Enable Fa
 - **Supported binaries**: Windows PE (`.exe`, `.dll`, `.sys`, `.exe_`), Linux ELF, macOS Mach-O, and existing IDA databases (`.idb`, `.i64`).
 - **Raw shellcode**: Check **Accept raw shellcode** and pick the architecture (`x64`, `x86`, `arm`, `arm64`). OmniIDB loads it at offset `0x0`.
 - **Auto-filtering**: Non-binary files (scripts, code, text, images) are skipped automatically during directory scans so your queue stays clean.
+- **Managed .NET assemblies**: The .NET mode exports a compilable ILSpy C# project, full CIL, metadata, strings, resources, and optional workspace analysis without launching IDA. ILSpyCmd is provisioned from the official NuGet package on first use when it is not already installed.
 
 ---
 
@@ -202,6 +203,17 @@ C:\Output\sample.exe-a1b2c3d4e5f6\
 │   ├── ida.log                 # Raw IDA console output
 │   └── failure.txt             # Error log with traceback (if a run failed)
 └── result.json                 # Execution stats, rename counts, cache hits, token usage
+```
+
+Managed .NET samples intentionally omit `IDB Files` and instead use:
+
+```text
+AI Workspace/
+├── src/                        # Decompiled C# project, one source file per type
+├── cil/                        # Full CIL method-body disassembly
+├── modules/                    # Metadata overviews
+├── catalog/                    # Assembly, type, import, string, and triage JSON
+└── malware_analysis_report.md  # When workspace analysis is selected
 ```
 
 ---

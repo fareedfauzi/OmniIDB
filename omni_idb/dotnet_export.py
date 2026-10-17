@@ -12,13 +12,80 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 
+ILSPYCMD_VERSION = "9.1.0.7988"
+
+
 def is_ilspycmd_available() -> Optional[str]:
     """Check if ilspycmd is available on PATH."""
-    return shutil.which("ilspycmd") or shutil.which("ilspycmd.exe")
+    direct = shutil.which("ilspycmd") or shutil.which("ilspycmd.exe")
+    if direct:
+        return direct
+    user_tool = Path.home() / ".dotnet" / "tools" / ("ilspycmd.exe" if os.name == "nt" else "ilspycmd")
+    return str(user_tool) if user_tool.is_file() else None
+
+
+def _tool_cache_dir() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / "OmniIDB" / "tools" / "ilspycmd" / ILSPYCMD_VERSION
+
+
+def resolve_ilspycmd(log: Callable[[str], None]) -> List[str]:
+    """Resolve ILSpyCmd, downloading the pinned official NuGet tool when needed."""
+    direct = is_ilspycmd_available()
+    if direct:
+        return [direct]
+    dotnet = shutil.which("dotnet") or shutil.which("dotnet.exe")
+    if not dotnet:
+        raise RuntimeError("C# decompilation requires the .NET 8 runtime and ilspycmd. Install .NET 8, then retry.")
+    cache = _tool_cache_dir()
+    dll = cache / "tools" / "net8.0" / "any" / "ilspycmd.dll"
+    if dll.is_file():
+        return [dotnet, str(dll)]
+
+    log(f"ilspycmd was not found; downloading official ILSpyCmd {ILSPYCMD_VERSION} from NuGet...")
+    cache.mkdir(parents=True, exist_ok=True)
+    package = cache / f"ilspycmd.{ILSPYCMD_VERSION}.nupkg"
+    url = f"https://api.nuget.org/v3-flatcontainer/ilspycmd/{ILSPYCMD_VERSION}/ilspycmd.{ILSPYCMD_VERSION}.nupkg"
+    try:
+        urllib.request.urlretrieve(url, package)
+        root = cache.resolve()
+        with zipfile.ZipFile(package) as archive:
+            for member in archive.infolist():
+                target = (cache / member.filename).resolve()
+                if root != target and root not in target.parents:
+                    raise RuntimeError(f"Unsafe path in ILSpyCmd package: {member.filename}")
+            archive.extractall(cache)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not provision ilspycmd for C# decompilation. Install it with "
+            f"`dotnet tool install --global ilspycmd --version {ILSPYCMD_VERSION}`. Error: {exc}"
+        ) from exc
+    finally:
+        try:
+            package.unlink()
+        except OSError:
+            pass
+    if not dll.is_file():
+        candidates = list(cache.rglob("ilspycmd.dll"))
+        if not candidates:
+            raise RuntimeError("The downloaded ILSpyCmd package did not contain ilspycmd.dll.")
+        dll = candidates[0]
+    return [dotnet, str(dll)]
+
+
+def _decode_user_string(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-16-le", errors="replace").rstrip("\x00")
+    return str(value or "")
 
 
 def _format_flags(f: Any) -> str:
@@ -58,6 +125,10 @@ def export_dotnet_workspace(
     cat_dir = ws_dir / "catalog"
     mod_dir = ws_dir / "modules"
     src_dir = ws_dir / "src"
+
+    for generated_dir in (cat_dir, mod_dir, src_dir, ws_dir / "cil"):
+        if generated_dir.is_dir():
+            shutil.rmtree(generated_dir)
 
     cat_dir.mkdir(parents=True, exist_ok=True)
     mod_dir.mkdir(parents=True, exist_ok=True)
@@ -195,7 +266,7 @@ def export_dotnet_workspace(
             while off < sz:
                 try:
                     data, item_sz = heap.get_with_size(off)
-                    s_val = str(data or "").strip()
+                    s_val = _decode_user_string(data).strip()
                     if s_val and len(s_val) >= 2:
                         user_strings.append(s_val)
                     off += max(1, item_sz)
@@ -238,11 +309,11 @@ def export_dotnet_workspace(
     (cat_dir / "strings.json").write_text(json.dumps(clean_strings, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
     (cat_dir / "triage_indicators.json").write_text(json.dumps(triage_info, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
 
-    # 7. Generate Module Disassembly / Pseudocode Overviews
+    # 7. Generate metadata overviews. Actual CIL is exported by ILSpyCmd below.
     for t in types_list:
         ns = t["namespace"].replace("<", "_").replace(">", "_").replace(":", "_")
         cname = t["name"].replace("<", "_").replace(">", "_").replace(":", "_").replace("`", "_")
-        il_file = mod_dir / f"{ns}_{cname}.il"
+        il_file = mod_dir / f"{ns}_{cname}.metadata.txt"
         lines = [
             f"// Type: {t['namespace']}.{t['name']}",
             f"// Base: {t['extends']}",
@@ -261,18 +332,33 @@ def export_dotnet_workspace(
         lines.append("}")
         il_file.write_text("\n".join(lines), encoding="utf-8")
 
-    # 8. Decompile to C# if ilspycmd is available
+    # 8. Decompile a complete C# project and real CIL with ILSpyCmd.
     decompiled_cs_count = 0
-    ilspy = is_ilspycmd_available()
-    if ilspy:
-        log("ilspycmd detected on system — decompiling full C# source tree...")
-        src_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            subprocess.run([ilspy, "-p", "-o", str(src_dir), str(sample_path)], check=True, capture_output=True, timeout=120)
-            decompiled_cs_count = len(list(src_dir.rglob("*.cs")))
-            log(f"Decompiled {decompiled_cs_count} C# source files into src/")
-        except Exception as exc:
-            log(f"Warning: ilspycmd decompilation failed: {exc}")
+    cil_count = 0
+    ilspy_command = resolve_ilspycmd(log)
+    log("Decompiling complete C# project and CIL with ILSpyCmd...")
+    src_dir.mkdir(parents=True, exist_ok=True)
+    cil_dir = ws_dir / "cil"
+    cil_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cs_result = subprocess.run(
+            [*ilspy_command, "--disable-updatecheck", "--nested-directories", "-p", "-o", str(src_dir), str(sample_path)],
+            check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+        decompiled_cs_count = len(list(src_dir.rglob("*.cs")))
+        if decompiled_cs_count == 0:
+            raise RuntimeError(cs_result.stderr.strip() or "ILSpyCmd produced no C# files")
+        il_result = subprocess.run(
+            [*ilspy_command, "--disable-updatecheck", "-il", "-o", str(cil_dir), str(sample_path)],
+            check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+        cil_count = len(list(cil_dir.rglob("*.il")))
+        if cil_count == 0 and il_result.stdout.strip():
+            (cil_dir / "assembly.il").write_text(il_result.stdout, encoding="utf-8")
+            cil_count = 1
+        log(f"Decompiled {decompiled_cs_count} C# source files and {cil_count} CIL files")
+    except Exception as exc:
+        raise RuntimeError(f"ILSpyCmd could not decompile the assembly: {exc}") from exc
 
     # 9. Write AGENTS.md and CLAUDE.md for AI Investigation
     agents_md = [
@@ -291,7 +377,8 @@ def export_dotnet_workspace(
         "- `catalog/imports.json`: Native Win32 P/Invoke API imports and referenced .NET packages.",
         "- `catalog/strings.json`: String literals extracted from the `#US` (User String) stream.",
         "- `catalog/triage_indicators.json`: High-priority suspicious behavior indicators.",
-        "- `modules/*.il`: Disassembled CIL signatures and class structures.",
+        "- `modules/*.metadata.txt`: Type, field, and method metadata overviews.",
+        f"- `cil/*.il`: Full CIL method-body disassembly ({cil_count} files).",
     ]
     if decompiled_cs_count > 0:
         agents_md.append(f"- `src/**/*.cs`: High-level decompiled C# source code ({decompiled_cs_count} files).")
@@ -310,12 +397,13 @@ def export_dotnet_workspace(
         "## Agent Investigation Guidelines",
         "1. Inspect `catalog/imports.json` for external native capabilities and P/Invoke calls.",
         "2. Examine `catalog/strings.json` for command and control endpoints, file paths, or registry keys.",
-        "3. Review `modules/*.il` or `src/**/*.cs` for the main execution logic and control flow.",
+        "3. Review `src/**/*.cs` and `cil/*.il` for the main execution logic and control flow.",
     ])
 
     agents_content = "\n".join(agents_md)
     (ws_dir / "AGENTS.md").write_text(agents_content, encoding="utf-8")
     (ws_dir / "CLAUDE.md").write_text(agents_content, encoding="utf-8")
+    (ws_dir / "README.md").write_text(agents_content, encoding="utf-8")
 
     log(f"[OK] .NET AI Workspace exported successfully ({len(types_list)} types, {len(pinvokes)} P/Invokes, {len(clean_strings)} strings)")
 
@@ -325,4 +413,5 @@ def export_dotnet_workspace(
         "pinvokes_count": len(pinvokes),
         "strings_count": len(clean_strings),
         "cs_count": decompiled_cs_count,
+        "cil_count": cil_count,
     }

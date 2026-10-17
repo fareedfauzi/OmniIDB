@@ -35,7 +35,7 @@ from .config import (
     provider_defaults,
     runner_script,
 )
-from .discovery import Sample, discover, format_size
+from .discovery import Sample, SampleKind, discover, format_size
 from .runner import OmniEvent, GenesectEvent, RunnerEvent, RunRequest
 
 # ---------------------------------------------------------------- palette
@@ -459,29 +459,34 @@ def ida_color(line: str) -> str:
     return "norm"
 
 
+SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+
 class QueueView(tk.Frame):
-    """Sample table with status badges and an aesthetic empty state."""
+    """Sample table with status badges, MD5 hashes, animated spinners, and an aesthetic empty state."""
 
     def __init__(self, master, compact: bool = False, on_open_output: Optional[Callable[[str], None]] = None):
         super().__init__(master, bg=CONSOLE_BG)
         self.compact = compact
         self.on_open_output = on_open_output
+        self.spinner_index = 0
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
         cols = (
-            ("n", "name", "status", "time_spent")
+            ("n", "name", "md5", "status", "time_spent")
             if compact
-            else ("n", "name", "status", "time_spent", "type", "size")
+            else ("n", "name", "md5", "status", "time_spent", "type", "size")
         )
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse", style="Omni.Treeview")
         heads = {
             "n": ("#", 42, 36),
-            "name": ("Sample Name", 340, 180),
-            "status": ("Status", 220, 140),
-            "time_spent": ("Time Spent", 110, 80),
-            "type": ("Type", 115, 80),
-            "size": ("Size", 90, 70),
+            "name": ("Sample Name", 300, 160),
+            "md5": ("MD5 Hash", 240, 140),
+            "status": ("Status", 240, 140),
+            "time_spent": ("Time Spent", 100, 80),
+            "type": ("Type", 110, 80),
+            "size": ("Size", 85, 65),
         }
         for col in cols:
             title, width, minw = heads[col]
@@ -498,6 +503,7 @@ class QueueView(tk.Frame):
         yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview, style="Vertical.TScrollbar")
         xscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview, style="Horizontal.TScrollbar")
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
 
         self.tree.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
@@ -566,6 +572,7 @@ class QueueView(tk.Frame):
             self.empty_frame.place(relx=0.5, rely=0.45, anchor="center")
             return
         self.empty_frame.place_forget()
+        spinner_char = SPINNER_FRAMES[self.spinner_index % len(SPINNER_FRAMES)]
         for index, sample in rows:
             tag = (
                 "done"
@@ -578,20 +585,25 @@ class QueueView(tk.Frame):
                 if sample.is_running()
                 else ""
             )
-            display_status = (
+            raw_stage = (
                 sample.stage
                 if sample.is_running() and sample.stage and sample.stage != "-"
                 else sample.status
             )
+            display_status = f"{spinner_char}  {raw_stage}" if sample.is_running() else raw_stage
+
+            sample_md5 = getattr(sample, "md5", "") or ""
             values = [
                 index + 1,
                 sample.path.name or str(sample.path),
+                sample_md5,
                 display_status,
                 sample.time_spent(),
             ]
             if not self.compact:
                 values += [sample.kind.label, format_size(sample.size)]
             self.tree.insert("", "end", iid=str(index), values=values, tags=(tag,))
+
 
 
 class ScrollableColumn(tk.Frame):
@@ -943,7 +955,6 @@ class OmniApp:
         s.analyze_workspace = (
             mode == "workspace_analysis"
             and self.v_workspace.get()
-            and is_cli_provider(self.v_provider.get())
         )
         s.dotnet_mode = self.v_dotnet_mode.get()
         s.recursive = self.v_recursive.get()
@@ -1209,12 +1220,12 @@ class OmniApp:
         if self.v_report_mode.get() == "investigate":
             self.turns_row.pack(fill="x", pady=(2, 4))
 
-        # 3. Exported Workspace CLI Agent
+        # 3. Exported Workspace AI Analysis
         r_ws = tk.Frame(rep_list, bg=CARD)
         r_ws.pack(fill="x", pady=2)
         self.rb_ws_analysis = ttk.Radiobutton(
             r_ws,
-            text="Exported Workspace CLI Agent (Autonomous agent analysis on exported C workspace -> MD report)",
+            text="Exported Workspace AI Analysis (analyze exported native or .NET code -> MD report)",
             variable=self.v_report_mode,
             value="workspace_analysis",
             command=self._report_mode_changed,
@@ -1222,7 +1233,7 @@ class OmniApp:
         self.rb_ws_analysis.pack(side="left")
         self.ws_analysis_badge = make_help_badge(
             r_ws,
-            "Instructs an autonomous CLI agent (Claude Code, Antigravity CLI, OpenCode, Copilot CLI) to inspect the exported workspace and generate a structured malware research report.",
+            "CLI agents inspect files directly. ChatGPT Account and API providers analyze a bounded evidence bundle of exported source and catalogs.",
         )
         self.ws_analysis_badge.pack(side="left", padx=6)
 
@@ -1514,32 +1525,15 @@ class OmniApp:
         if not hasattr(self, "rb_ws_analysis"):
             return
         provider = self.v_provider.get()
-        fb_enabled = self.v_fallback_enabled.get()
-        fb_provider = self.v_fallback_provider.get()
-
-        # Enabled if either main provider or fallback provider is a CLI agent
-        cli_mode = is_cli_provider(provider) or (fb_enabled and is_cli_provider(fb_provider))
-        if cli_mode:
-            self.rb_ws_analysis.configure(state="normal")
-            cli_name = provider if is_cli_provider(provider) else f"{fb_provider} (Fallback)"
-            if hasattr(self.ws_analysis_badge, "tooltip"):
-                self.ws_analysis_badge.tooltip.text = (
-                    f"Instructs the autonomous CLI agent ({cli_name}) "
-                    "to inspect the exported workspace and generate a structured malware research report.\n"
-                    "Selecting this mode automatically enables 'Export OmniIDB AI workspace'."
-                )
-            self.ws_analysis_badge.configure(fg=DIM)
-        else:
-            if self.v_report_mode.get() == "workspace_analysis":
-                self.v_report_mode.set("none")
-                self._report_mode_changed()
-            self.rb_ws_analysis.configure(state="disabled")
-            if hasattr(self.ws_analysis_badge, "tooltip"):
-                self.ws_analysis_badge.tooltip.text = (
-                    "⚠ Select a CLI Agent provider (Claude Code, Antigravity CLI, OpenCode, Copilot CLI) "
-                    "as either Main Provider or Fallback Provider to enable."
-                )
-            self.ws_analysis_badge.configure(fg=AMBER)
+        direct = is_cli_provider(provider)
+        self.rb_ws_analysis.configure(state="normal")
+        if hasattr(self.ws_analysis_badge, "tooltip"):
+            mode = "inspect the workspace directly" if direct else "analyze exported source and catalog evidence"
+            self.ws_analysis_badge.tooltip.text = (
+                f"{provider} will {mode} and generate a Markdown malware research report. "
+                "The configured fallback is used only if the primary fails. Selecting this mode automatically enables workspace export."
+            )
+        self.ws_analysis_badge.configure(fg=DIM)
 
 
     def _toggle_status_filter(self, key: str) -> None:
@@ -2039,9 +2033,10 @@ class OmniApp:
                 self.refresh_samples()
 
             error = None
+            needs_ida = any(sample.kind != SampleKind.DOTNET_ASSEMBLY for sample in self.samples)
             if not self.samples:
                 error = "No samples discovered. Choose a sample file or directory."
-            elif not self.settings.ida_path.strip() or not Path(self.settings.ida_path).is_file():
+            elif needs_ida and (not self.settings.ida_path.strip() or not Path(self.settings.ida_path).is_file()):
                 error = f"IDA executable not found at '{self.settings.ida_path}'."
             elif not self.settings.output_root.strip():
                 error = "Please specify an output directory."
@@ -2127,15 +2122,18 @@ class OmniApp:
             else:
                 self.ida_view.append(new_ida)
         now = time.time()
-        if self.running and (now - self._last_time_tick >= 1.0):
+        if self.running and (now - self._last_time_tick >= 0.15):
             self._last_time_tick = now
+            if hasattr(self, "queue_full"):
+                self.queue_full.spinner_index = (self.queue_full.spinner_index + 1) % len(SPINNER_FRAMES)
             self._mark_queue()
         if new_logs or new_ida or self.queue_dirty:
             self._update_tab_titles()
         if self.queue_dirty and self.console_tab == "Queue":
             self.queue_dirty = False
             self._render_queue()
-        self.root.after(100, self._poll)
+        self.root.after(80, self._poll)
+
 
     def _handle(self, ev: RunnerEvent, new_logs: list[str], new_ida: list[str]) -> None:
         d, kind = ev.data, ev.kind

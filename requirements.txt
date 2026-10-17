@@ -10,3 +10,6 @@ reportlab>=4.0.0
 
 # OpenAI API and ChatGPT Account Responses API integration
 openai>=1.0.0
+
+# Managed PE metadata extraction (.NET workspace export)
+dnfile>=0.17.0

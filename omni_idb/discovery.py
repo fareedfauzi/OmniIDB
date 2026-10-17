@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import hashlib
 import os
 import struct
 import time
@@ -12,6 +13,18 @@ from typing import Optional
 
 MAX_PROBE = 1024 * 1024
 MAX_SHELLCODE_SIZE = 256 * 1024 * 1024
+
+
+def compute_file_md5(path: Path) -> str:
+    """Fast MD5 checksum computation for a sample."""
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(262144), b""):
+                h.update(chunk)
+        return h.hexdigest().lower()
+    except Exception:
+        return ""
 
 
 class SampleKind(enum.Enum):
@@ -36,9 +49,11 @@ class Sample:
     kind: SampleKind
     status: str = "Ready"
     stage: str = "-"
+    md5: str = ""
     start_time: Optional[float] = None
     elapsed_seconds: Optional[float] = None
     added_time: str = field(default_factory=lambda: time.strftime("%H:%M:%S"))
+
 
     def is_pending(self) -> bool:
         return self.status in ("Ready", "Queued", "Pending", "")
@@ -279,7 +294,9 @@ def _push_classified(path: Path, allow_shellcode: bool, report: DiscoveryReport)
         size = path.stat().st_size
     except OSError:
         size = 0
-    report.samples.append(Sample(path, size, kind))
+    sample_md5 = compute_file_md5(path) if kind != SampleKind.IDA_DATABASE else ""
+    report.samples.append(Sample(path, size, kind, md5=sample_md5))
+
 
 
 SKIP_DISCOVERY_EXTENSIONS = {

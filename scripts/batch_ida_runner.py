@@ -195,7 +195,7 @@ def query_copilot_cli(executable, model, prompt, sys_prompt, timeout=120):
 def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root, job=None):
     original_request = renamer.ai_request
     chain = provider_chain(job or {})
-    state = {"index": 0, "empty": 0}
+    state = {"index": 0}
     resolved_account_model = [None]
     account_oauth_module = [None]
 
@@ -215,7 +215,6 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
         state["index"] += 1
         worker_cfg.update(apply_profile(chain[state["index"]], config))
         resolved_account_model[0] = None
-        state["empty"] = 0
         new = worker_cfg.get("profile_name")
         PROVIDER_INFO["active"] = new
         if new not in PROVIDER_INFO["used"]:
@@ -306,8 +305,8 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
             if cancel_checker and cancel_checker():
                 return ""
             profile_name = worker_cfg.get("profile_name", "OpenAI")
-            url = worker_cfg.get("url") or ""
-            if tracker and not tracker.allowed(profile_name, url):
+            api_url = worker_cfg.get("api_url") or ""
+            if tracker and not tracker.allowed(profile_name, api_url):
                 if switch_provider("token budget reached"):
                     continue
                 from omni_idb.usage import BudgetExceeded
@@ -321,20 +320,18 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
                     continue
                 raise
             if not result and not (cancel_checker and cancel_checker()):
-                state["empty"] += 1
                 # Quota/auth failures often surface as empty replies on CLI providers.
-                if state["empty"] >= 3 and switch_provider("%d consecutive empty replies" % state["empty"]):
+                # Retry this request on the fallback instead of returning a lost result.
+                if switch_provider("empty response"):
                     continue
-            else:
-                state["empty"] = 0
             if tracker and result:
                 try:
                     tracker.record(
                         provider=profile_name,
                         model=worker_cfg.get("model") or "default",
-                        url=url,
-                        prompt_chars=len(prompt or "") + len(sys_prompt or ""),
-                        response_chars=len(result or ""),
+                        api_url=api_url,
+                        input_text=(sys_prompt or "") + "\n\n" + (prompt or ""),
+                        output_text=result,
                     )
                 except Exception:
                     pass
@@ -1337,7 +1334,32 @@ def _run_cli_agent_workspace(provider, executable, model, ws_path, prompt, timeo
     if proc.returncode != 0:
         err = proc.stderr.strip() or proc.stdout.strip()
         raise RuntimeError("%s exited with code %s: %s" % (provider, proc.returncode, err))
-    return proc.stdout.strip() or proc.stderr.strip()
+
+    raw_output = proc.stdout.strip() or proc.stderr.strip()
+
+    # Detect if agent (e.g. Antigravity CLI / agy) wrote an artifact report file and only printed a summary
+    # e.g.: [report_name.md](file:///C:/Users/.../report_name.md)
+    import re
+    import urllib.parse
+    artifact_pattern = re.search(r"\[([^\]]+\.md)\]\((file:///[^\)]+)\)", raw_output, re.IGNORECASE)
+    if artifact_pattern:
+        file_url = artifact_pattern.group(2)
+        try:
+            parsed = urllib.parse.urlparse(file_url)
+            local_path = urllib.parse.unquote(parsed.path)
+            if local_path.startswith("/") and len(local_path) > 3 and local_path[2] == ":":
+                local_path = local_path[1:]
+            art_file = Path(local_path)
+            if art_file.is_file() and art_file.stat().st_size > len(raw_output):
+                full_content = art_file.read_text(encoding="utf-8", errors="replace")
+                if full_content.strip():
+                    emit("log", "Resolved full report from agent artifact: %s (%d bytes)" % (art_file.name, len(full_content)), level="ok")
+                    return full_content
+        except Exception:
+            pass
+
+    return raw_output
+
 
 
 def _build_workspace_context_prompt(ws, base_prompt):
@@ -1388,19 +1410,12 @@ def _build_workspace_context_prompt(ws, base_prompt):
 
 
 def run_workspace_analysis(job, cfg, renamer, workspace_path):
-    """Analyze the exported AI workspace and write a technical malware analysis report using a CLI Agent."""
+    """Analyze an exported workspace, preserving primary-first provider order."""
     profile = job.get("profile") or {}
-    fb_profile = job.get("fallback_profile") or {}
 
     provider = str(profile.get("provider") or job.get("provider") or PROVIDER_INFO.get("active") or "").strip()
     executable = str(profile.get("executable") or job.get("executable") or "").strip()
     model = str(profile.get("model") or job.get("model") or "").strip()
-
-    # If primary is not a CLI agent (e.g. ChatGPTAccount), but fallback is a CLI agent (e.g. AntigravityCLI)
-    if provider not in CLI_PROVIDERS and job.get("fallback_enabled") and fb_profile.get("provider") in CLI_PROVIDERS:
-        provider = str(fb_profile.get("provider")).strip()
-        executable = str(fb_profile.get("executable") or "").strip()
-        model = str(fb_profile.get("model") or "").strip()
 
     ws = Path(workspace_path)
 
@@ -1454,9 +1469,12 @@ def run_workspace_analysis(job, cfg, renamer, workspace_path):
         "- Do not infer capabilities or malicious intent from isolated APIs or strings.\n"
         "- Avoid unsupported classifications, such as treating every HTTP request as C2 or ordinary delays as sandbox evasion.\n"
         "- Retain useful source references without excessive inline citations.\n"
-        "- Remove unsupported claims rather than rewriting them as facts.\n\n"
+        "## 6. Output Format\n"
+        "- Output the ENTIRE full, complete technical research report directly in Markdown format.\n"
+        "- Do NOT write just a brief summary or redirect to an artifact file; output the entire comprehensive document from title to conclusions.\n\n"
         "Write the publication-quality malware research report now in Markdown format:"
     ) % str(ws.resolve())
+
 
     report_text = None
     if provider in CLI_PROVIDERS:
