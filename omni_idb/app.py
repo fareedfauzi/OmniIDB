@@ -390,15 +390,24 @@ def make_help_badge(parent, text: str) -> tk.Label:
 class LogView(tk.Frame):
     """Read-only, auto-scrolling, colorised text console with JetBrains Mono."""
 
-    def __init__(self, master, colorizer: Callable[[str], str], placeholder: str):
+    def __init__(
+        self,
+        master,
+        colorizer: Callable[[str], str],
+        placeholder: str,
+        on_clear: Optional[Callable[[], None]] = None,
+        on_save: Optional[Callable[[], None]] = None,
+    ):
         super().__init__(master, bg=CONSOLE_BG, highlightthickness=1, highlightbackground=CARD_BORDER)
         self._colorizer = colorizer
         self._placeholder = placeholder
+        self.on_clear = on_clear
+        self.on_save = on_save
         self.text = tk.Text(
             self, bg=CONSOLE_BG, fg="#CBD5E1", font=MONO, wrap="word", relief="flat", bd=0,
             padx=10, pady=8, state="disabled", insertbackground=FG, selectbackground="#1D4ED8",
         )
-        scroll = ttk.Scrollbar(self, command=self.text.yview)
+        scroll = ttk.Scrollbar(self, orient="vertical", command=self.text.yview, style="Vertical.TScrollbar")
         self.text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.text.pack(side="left", fill="both", expand=True)
@@ -406,7 +415,44 @@ class LogView(tk.Frame):
             self.text.tag_configure(name, foreground=color)
         self.text.tag_configure("placeholder", foreground=DIM, font=(FONT_FAMILY, 9, "italic"))
         self._count = 0
+
+        # Right-click context menu
+        self.context_menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=BLUE, activeforeground="#FFFFFF", font=UI_FONT)
+        self.context_menu.add_command(label="Copy", command=self._copy_selection_or_all)
+        self.context_menu.add_command(label="Select All", command=self._select_all)
+        self.context_menu.add_separator()
+        if self.on_save:
+            self.context_menu.add_command(label="Save to File...", command=self.on_save)
+        if self.on_clear:
+            self.context_menu.add_command(label="Clear", command=self.on_clear)
+
+        self.text.bind("<Button-3>", self._on_right_click)
+        self.text.bind("<Control-a>", self._select_all_event)
+        self.text.bind("<Control-A>", self._select_all_event)
         self.clear()
+
+    def _select_all_event(self, event=None) -> str:
+        self._select_all()
+        return "break"
+
+    def _select_all(self) -> None:
+        if self._count > 0:
+            self.text.tag_add("sel", "1.0", "end")
+
+    def _copy_selection_or_all(self) -> None:
+        try:
+            if self.text.tag_ranges("sel"):
+                selected_text = self.text.get("sel.first", "sel.last")
+            else:
+                selected_text = self.text.get("1.0", "end-1c")
+            if selected_text and selected_text != self._placeholder:
+                self.clipboard_clear()
+                self.clipboard_append(selected_text)
+        except Exception:
+            pass
+
+    def _on_right_click(self, event) -> None:
+        self.context_menu.post(event.x_root, event.y_root)
 
     def clear(self) -> None:
         self.text.configure(state="normal")
@@ -414,6 +460,14 @@ class LogView(tk.Frame):
         self.text.insert("end", self._placeholder, "placeholder")
         self.text.configure(state="disabled")
         self._count = 0
+
+    def trim_top(self, count: int) -> None:
+        if count <= 0 or self._count == 0:
+            return
+        self.text.configure(state="normal")
+        self.text.delete("1.0", f"{count + 1}.0")
+        self._count = max(0, self._count - count)
+        self.text.configure(state="disabled")
 
     def set_lines(self, lines: list[str]) -> None:
         self.clear()
@@ -423,7 +477,7 @@ class LogView(tk.Frame):
     def append(self, lines: list[str]) -> None:
         if not lines:
             return
-        at_bottom = self.text.yview()[1] >= 0.999
+        at_bottom = self._count == 0 or self.text.yview()[1] >= 0.95
         self.text.configure(state="normal")
         if self._count == 0:
             self.text.delete("1.0", "end")
@@ -436,26 +490,49 @@ class LogView(tk.Frame):
 
 
 def activity_color(line: str) -> str:
-    if line.startswith("✓") or "complete" in line.lower():
+    s = line.strip()
+    if s.startswith("--- Batch"):
+        if "0 failed" in s and ("Finished" in s or "succeeded" in s):
+            return "ok"
+        if "failed" in s and not (" 0 failed" in s or "0 failed," in s):
+            return "err"
+        return "dim"
+
+    if s.startswith(("✓", "[+]")):
         return "ok"
-    if line.startswith("✗") or "failed" in line.lower() or "error" in line.lower():
+    if s.startswith(("✗", "[-]")):
         return "err"
-    if line.startswith("▶") or "opening" in line.lower() or "running" in line.lower():
+    if s.startswith(("▶", "[*]", "->", "=>")):
         return "run"
-    if line.startswith("⚠") or "warn" in line.lower():
+    if s.startswith(("⚠", "[!]")):
         return "warn"
+    if s.startswith(("---", "===", "...")):
+        return "dim"
+
+    lower = s.lower()
+    if any(k in lower for k in ("failover", "fallback")):
+        return "warn"
+    if any(k in lower for k in ("error:", "exception:", "failed:", "failure:", "could not")):
+        return "err"
+    if any(k in lower for k in ("succeeded", "success", "successfully", "completed successfully")):
+        return "ok"
+    if any(k in lower for k in ("opening in ida", "running in ida", "analyzing", "decompiling")):
+        return "run"
+
     return "norm"
 
 
 def ida_color(line: str) -> str:
-    if any(w in line for w in ("Error", "ERROR", "failed", "Exception")):
-        return "err"
-    if "Warning" in line or "WARNING" in line:
-        return "warn"
-    if any(w in line for w in ("OK", "successfully", "initialized")):
-        return "ok"
-    if line.startswith(("---", "===", "###")):
+    s = line.strip()
+    if s.startswith(("---", "===", "###")):
         return "dim"
+    lower = s.lower()
+    if any(p in lower for p in ("fatal:", "error:", "exception:", "internal error", "failed to", "cannot open")):
+        return "err"
+    if any(p in lower for p in ("warning:", "caution:")):
+        return "warn"
+    if any(p in lower for p in ("successfully", "completed", "autoanalysis done")):
+        return "ok"
     return "norm"
 
 
@@ -465,10 +542,29 @@ SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 class QueueView(tk.Frame):
     """Sample table with status badges, MD5 hashes, animated spinners, and an aesthetic empty state."""
 
-    def __init__(self, master, compact: bool = False, on_open_output: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        master,
+        compact: bool = False,
+        on_open_output: Optional[Callable[[str], None]] = None,
+        on_open_report: Optional[Callable[[str, str], None]] = None,
+        on_open_location: Optional[Callable[[str], None]] = None,
+        on_copy_path: Optional[Callable[[str], None]] = None,
+        on_copy_md5: Optional[Callable[[str], None]] = None,
+        on_remove_sample: Optional[Callable[[str], None]] = None,
+        on_sort: Optional[Callable[[str], None]] = None,
+        is_running_fn: Optional[Callable[[], bool]] = None,
+    ):
         super().__init__(master, bg=CONSOLE_BG)
         self.compact = compact
         self.on_open_output = on_open_output
+        self.on_open_report = on_open_report
+        self.on_open_location = on_open_location
+        self.on_copy_path = on_copy_path
+        self.on_copy_md5 = on_copy_md5
+        self.on_remove_sample = on_remove_sample
+        self.on_sort = on_sort
+        self.is_running_fn = is_running_fn
         self.spinner_index = 0
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -479,7 +575,7 @@ class QueueView(tk.Frame):
             else ("n", "name", "md5", "status", "time_spent", "type", "size")
         )
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse", style="Omni.Treeview")
-        heads = {
+        self.orig_heads = {
             "n": ("#", 42, 36),
             "name": ("Sample Name", 300, 160),
             "md5": ("MD5 Hash", 240, 140),
@@ -489,9 +585,9 @@ class QueueView(tk.Frame):
             "size": ("Size", 85, 65),
         }
         for col in cols:
-            title, width, minw = heads[col]
-            self.tree.heading(col, text=title)
-            self.tree.column(col, width=width, minwidth=minw, anchor="w", stretch=False)
+            title, width, minw = self.orig_heads[col]
+            self.tree.heading(col, text=title, command=lambda c=col: self._on_heading_click(c))
+            self.tree.column(col, width=width, minwidth=minw, anchor="w", stretch=(col == "name"))
         for tag, (bg, fg) in {
             "done": STATUS_COLORS["Complete"],
             "fail": STATUS_COLORS["Failed"],
@@ -504,18 +600,28 @@ class QueueView(tk.Frame):
         xscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview, style="Horizontal.TScrollbar")
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
 
-
         self.tree.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
 
-        # Double-click and Enter key binding to open sample output folder
+        # Double-click and keyboard shortcuts
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Return>", self._on_double_click)
+        self.tree.bind("<Delete>", self._on_delete_key)
+        self.tree.bind("<Control-c>", self._on_copy_path_key)
+        self.tree.bind("<Control-C>", self._on_copy_path_key)
 
         # Right-click context menu
         self.context_menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=BLUE, activeforeground="#FFFFFF", font=UI_FONT)
         self.context_menu.add_command(label="Open Output Folder", command=self._open_selected_folder)
+        self.context_menu.add_command(label="Open HTML Report", command=self._open_selected_report_html)
+        self.context_menu.add_command(label="Open PDF Report", command=self._open_selected_report_pdf)
+        self.context_menu.add_command(label="Open File Location", command=self._open_selected_location)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Copy Sample Path", command=self._copy_selected_path)
+        self.context_menu.add_command(label="Copy MD5 Hash", command=self._copy_selected_md5)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Remove from Queue", command=self._remove_selected)
         self.tree.bind("<Button-3>", self._on_right_click)
 
         # Empty state canvas & label
@@ -533,6 +639,20 @@ class QueueView(tk.Frame):
         )
         self.empty_label.pack()
 
+    def _on_heading_click(self, col: str) -> None:
+        if self.on_sort:
+            self.on_sort(col)
+
+    def update_sort_indicators(self, active_col: Optional[str], desc: bool) -> None:
+        for col, (title, _, _) in self.orig_heads.items():
+            if col not in self.tree["columns"]:
+                continue
+            if col == active_col:
+                arrow = " ▼" if desc else " ▲"
+                self.tree.heading(col, text=f"{title}{arrow}")
+            else:
+                self.tree.heading(col, text=title)
+
     def _on_double_click(self, event=None) -> None:
         if event and hasattr(event, "y"):
             region = self.tree.identify_region(event.x, event.y)
@@ -549,12 +669,54 @@ class QueueView(tk.Frame):
         row_id = self.tree.identify_row(event.y)
         if row_id:
             self.tree.selection_set(row_id)
+            is_running = self.is_running_fn() if self.is_running_fn else False
+            remove_state = "disabled" if is_running else "normal"
+            try:
+                self.context_menu.entryconfigure("Remove from Queue", state=remove_state)
+            except Exception:
+                pass
             self.context_menu.post(event.x_root, event.y_root)
 
     def _open_selected_folder(self) -> None:
         sel = self.tree.selection()
         if sel and self.on_open_output:
             self.on_open_output(sel[0])
+
+    def _open_selected_report_html(self) -> None:
+        sel = self.tree.selection()
+        if sel and self.on_open_report:
+            self.on_open_report(sel[0], "html")
+
+    def _open_selected_report_pdf(self) -> None:
+        sel = self.tree.selection()
+        if sel and self.on_open_report:
+            self.on_open_report(sel[0], "pdf")
+
+    def _open_selected_location(self) -> None:
+        sel = self.tree.selection()
+        if sel and self.on_open_location:
+            self.on_open_location(sel[0])
+
+    def _copy_selected_path(self) -> None:
+        sel = self.tree.selection()
+        if sel and self.on_copy_path:
+            self.on_copy_path(sel[0])
+
+    def _copy_selected_md5(self) -> None:
+        sel = self.tree.selection()
+        if sel and self.on_copy_md5:
+            self.on_copy_md5(sel[0])
+
+    def _remove_selected(self) -> None:
+        sel = self.tree.selection()
+        if sel and self.on_remove_sample:
+            self.on_remove_sample(sel[0])
+
+    def _on_delete_key(self, event=None) -> None:
+        self._remove_selected()
+
+    def _on_copy_path_key(self, event=None) -> None:
+        self._copy_selected_path()
 
     @staticmethod
     def _draw_empty_icon(canvas: tk.Canvas) -> None:
@@ -566,43 +728,81 @@ class QueueView(tk.Frame):
         canvas.create_arc(20, 18, 28, 26, start=180, extent=180, style="arc", outline="#38BDF8", width=1.5)
 
     def refresh(self, rows: list[tuple[int, Sample]], empty_message: Optional[str]) -> None:
-        self.tree.delete(*self.tree.get_children())
         if empty_message:
+            self.tree.delete(*self.tree.get_children())
             self.empty_label.configure(text=empty_message)
             self.empty_frame.place(relx=0.5, rely=0.45, anchor="center")
             return
         self.empty_frame.place_forget()
-        spinner_char = SPINNER_FRAMES[self.spinner_index % len(SPINNER_FRAMES)]
-        for index, sample in rows:
-            tag = (
-                "done"
-                if sample.is_complete()
-                else "fail"
-                if sample.is_failed()
-                else "skip"
-                if sample.is_skipped()
-                else "run"
-                if sample.is_running()
-                else ""
-            )
-            raw_stage = (
-                sample.stage
-                if sample.is_running() and sample.stage and sample.stage != "-"
-                else sample.status
-            )
-            display_status = f"{spinner_char}  {raw_stage}" if sample.is_running() else raw_stage
 
-            sample_md5 = getattr(sample, "md5", "") or ""
-            values = [
-                index + 1,
-                sample.path.name or str(sample.path),
-                sample_md5,
-                display_status,
-                sample.time_spent(),
-            ]
-            if not self.compact:
-                values += [sample.kind.label, format_size(sample.size)]
-            self.tree.insert("", "end", iid=str(index), values=values, tags=(tag,))
+        spinner_char = SPINNER_FRAMES[self.spinner_index % len(SPINNER_FRAMES)]
+        target_iids = [str(index) for index, _ in rows]
+        target_set = set(target_iids)
+        current_children = self.tree.get_children()
+
+        prev_selection = self.tree.selection()
+
+        if list(current_children) != target_iids:
+            self.tree.delete(*self.tree.get_children())
+            for index, sample in rows:
+                tag = (
+                    "done" if sample.is_complete()
+                    else "fail" if sample.is_failed()
+                    else "skip" if sample.is_skipped()
+                    else "run" if sample.is_running()
+                    else ""
+                )
+                raw_stage = (
+                    sample.stage
+                    if sample.is_running() and sample.stage and sample.stage != "-"
+                    else sample.status
+                )
+                display_status = f"{spinner_char}  {raw_stage}" if sample.is_running() else raw_stage
+                sample_md5 = getattr(sample, "md5", "") or "--"
+                values = [
+                    index + 1,
+                    sample.path.name or str(sample.path),
+                    sample_md5,
+                    display_status,
+                    sample.time_spent(),
+                ]
+                if not self.compact:
+                    values += [sample.kind.label, format_size(sample.size)]
+                self.tree.insert("", "end", iid=str(index), values=values, tags=(tag,))
+        else:
+            for index, sample in rows:
+                tag = (
+                    "done" if sample.is_complete()
+                    else "fail" if sample.is_failed()
+                    else "skip" if sample.is_skipped()
+                    else "run" if sample.is_running()
+                    else ""
+                )
+                raw_stage = (
+                    sample.stage
+                    if sample.is_running() and sample.stage and sample.stage != "-"
+                    else sample.status
+                )
+                display_status = f"{spinner_char}  {raw_stage}" if sample.is_running() else raw_stage
+                sample_md5 = getattr(sample, "md5", "") or "--"
+                values = [
+                    index + 1,
+                    sample.path.name or str(sample.path),
+                    sample_md5,
+                    display_status,
+                    sample.time_spent(),
+                ]
+                if not self.compact:
+                    values += [sample.kind.label, format_size(sample.size)]
+                self.tree.item(str(index), values=values, tags=(tag,))
+
+        if prev_selection:
+            valid_sel = [s for s in prev_selection if s in target_set]
+            if valid_sel:
+                try:
+                    self.tree.selection_set(valid_sel)
+                except Exception:
+                    pass
 
 
 
@@ -891,7 +1091,8 @@ class OmniApp:
         from .go_support import resolve_goresym
         self.v_input = tk.StringVar(value=s.input_path)
         self.v_output = tk.StringVar(value=s.output_root)
-        self.v_ida = tk.StringVar(value=s.ida_path or str(detect_ida() or ""))
+        ida_cand = s.ida_path if (s.ida_path and Path(s.ida_path).is_file()) else str(detect_ida() or s.ida_path or "")
+        self.v_ida = tk.StringVar(value=ida_cand)
         go_path = s.goresym_path if (s.goresym_path and "_MEI" not in s.goresym_path and Path(s.goresym_path).is_file()) else resolve_goresym()
         self.v_goresym = tk.StringVar(value=go_path)
         self.v_provider = tk.StringVar(value=s.provider)
@@ -908,6 +1109,7 @@ class OmniApp:
         self.v_fallback_model = tk.StringVar(value=s.fallback_model)
         self.v_fallback_exe = tk.StringVar(value=s.fallback_executable)
         self.v_rename_fn = tk.BooleanVar(value=s.rename_functions)
+        self.v_rename_fn_addr = tk.BooleanVar(value=getattr(s, "rename_functions_with_address", False))
         self.v_rename_var = tk.BooleanVar(value=s.rename_variables)
         self.v_workspace = tk.BooleanVar(value=s.generate_workspace)
         # By default make AI investigation and reporting "None"
@@ -917,24 +1119,26 @@ class OmniApp:
         self.v_dotnet_mode = tk.StringVar(value=getattr(s, "dotnet_mode", "skip") or "skip")
         self.v_turns = tk.IntVar(value=s.investigation_turns)
         self.v_recursive = tk.BooleanVar(value=s.recursive)
-        self.v_shellcode = tk.BooleanVar(value=s.allow_shellcode)
-        self.v_arch = tk.StringVar(value=s.shellcode_arch)
         self.v_batch = tk.IntVar(value=s.batch_size)
+        self.v_workers = tk.IntVar(value=getattr(s, "workers", 3))
+        self.v_low_score_rescan = tk.BooleanVar(value=getattr(s, "low_score_rescan", False))
         self.v_cache = tk.BooleanVar(value=s.use_rename_cache)
         self.v_token_budget = tk.IntVar(value=s.token_budget)
         self.v_filter = tk.StringVar()
         self.v_status_filter = tk.StringVar(value="All")
         self.v_queued = tk.StringVar(value="0 sample(s) queued")
+        self.sort_col: Optional[str] = None
+        self.sort_desc: bool = False
         for var in (self.v_filter, self.v_status_filter):
             var.trace_add("write", lambda *_: self._mark_queue())
 
     def _pull_settings(self) -> None:
         """Copy widget values back into ``self.settings``."""
         s = self.settings
-        s.input_path = self.v_input.get()
-        s.output_root = self.v_output.get()
-        s.ida_path = self.v_ida.get()
-        s.goresym_path = self.v_goresym.get()
+        s.input_path = self.v_input.get().strip().strip("\"'")
+        s.output_root = self.v_output.get().strip().strip("\"'")
+        s.ida_path = self.v_ida.get().strip().strip("\"'")
+        s.goresym_path = self.v_goresym.get().strip().strip("\"'")
         if not s.genesect_root:
             s.genesect_root = str(detect_engine_root() or project_root())
         s.provider = self.v_provider.get()
@@ -947,6 +1151,7 @@ class OmniApp:
         s.fallback_model = self.v_fallback_model.get()
         s.fallback_executable = self.v_fallback_exe.get()
         s.rename_functions = self.v_rename_fn.get()
+        s.rename_functions_with_address = self.v_rename_fn_addr.get()
         s.rename_variables = self.v_rename_var.get()
         s.use_rename_cache = self.v_cache.get()
         s.generate_workspace = self.v_workspace.get()
@@ -958,11 +1163,11 @@ class OmniApp:
         )
         s.dotnet_mode = self.v_dotnet_mode.get()
         s.recursive = self.v_recursive.get()
-        s.allow_shellcode = self.v_shellcode.get()
-        s.shellcode_arch = self.v_arch.get()
         try:
             s.investigation_turns = max(3, min(30, int(self.v_turns.get())))
             s.batch_size = max(1, min(50, int(self.v_batch.get())))
+            s.workers = max(1, min(8, int(self.v_workers.get())))
+            s.low_score_rescan = self.v_low_score_rescan.get()
             s.token_budget = max(0, int(self.v_token_budget.get()))
         except (tk.TclError, ValueError):
             pass
@@ -1007,25 +1212,18 @@ class OmniApp:
         entry_input = ttk.Entry(r1, textvariable=self.v_input)
         entry_input.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         entry_input.bind("<Return>", lambda _e: self.refresh_samples())
+        entry_input.bind("<FocusOut>", lambda _e: self.refresh_samples())
 
         # Curved Edge Buttons: Browse & Add Samples
         RoundedButton(r1, "📁 Browse...", command=self.choose_input_file, bg_color=CARD, radius=6, padx=10, pady=4).grid(row=0, column=1, padx=(0, 6))
         RoundedButton(r1, "➕ Add Samples...", command=self.choose_input_folder, bg_color=CARD, radius=6, padx=10, pady=4).grid(row=0, column=2)
 
-        # Row 2 options: Recursive, Shellcode, Arch
+        # Row 2 options: Recursive
         r2 = tk.Frame(target, bg=CARD)
         r2.pack(fill="x")
         ttk.Checkbutton(
             r2, text="Scan subfolders recursively", variable=self.v_recursive, command=self.refresh_samples,
-        ).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(
-            r2, text="Accept raw shellcode (.bin/.raw/.sc/.shellcode)", variable=self.v_shellcode, command=self._shellcode_toggled,
-        ).pack(side="left", padx=(0, 16))
-        tk.Label(r2, text="Architecture:", bg=CARD, fg=MUTED, font=SUB_FONT).pack(side="left", padx=(0, 6))
-        self.arch_box = ttk.Combobox(
-            r2, textvariable=self.v_arch, values=["x64", "x86", "arm", "arm64"], state="readonly", width=8,
-        )
-        self.arch_box.pack(side="left")
+        ).pack(side="left")
 
         # 3. Main Body Split Pane: Left = Configurations, Right = Run Bar + Long Queue/Log Table
         body_pane = tk.Frame(outer, bg=BG)
@@ -1093,8 +1291,16 @@ class OmniApp:
             widget = widget_factory(self.fb_body)
             self.fb_rows[key] = (lab, widget)
 
+        def make_fb_exe_box(p):
+            f = tk.Frame(p, bg=CARD)
+            f.columnconfigure(0, weight=1)
+            ttk.Entry(f, textvariable=self.v_fallback_exe).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+            RoundedButton(f, "Browse...", command=lambda: self._pick_file(self.v_fallback_exe, title="Select Fallback CLI Binary"), bg_color=CARD, padx=8, pady=3, radius=6).grid(row=0, column=1)
+            return f
+
         add_fb_row("provider", "Fallback:", lambda p: ttk.Combobox(p, textvariable=self.v_fallback_provider, values=PROVIDERS, state="readonly", width=22))
-        add_fb_row("exe", "CLI Binary:", lambda p: ttk.Entry(p, textvariable=self.v_fallback_exe))
+        add_fb_row("exe", "CLI Binary:", make_fb_exe_box)
+        add_fb_row("signin", "Sign-in:", lambda p: tk.Frame(p, bg=CARD))
         add_fb_row("url", "API URL:", lambda p: ttk.Entry(p, textvariable=self.v_fallback_url))
         add_fb_row("key", "API Key:", lambda p: ttk.Entry(p, textvariable=self.v_fallback_key, show="•"))
 
@@ -1155,19 +1361,48 @@ class OmniApp:
             make_help_badge(row, help_text).pack(side="left", padx=6)
             return row
 
+        def _update_select_all_btn() -> None:
+            all_on = all([self.v_rename_fn.get(), self.v_rename_var.get(), self.v_workspace.get()])
+            self.select_all_btn.set_text("Deselect All" if all_on else "Select All")
+
+        def _on_op_change() -> None:
+            self._update_rename_fn_state()
+            _update_select_all_btn()
+
+        def _on_ws_change() -> None:
+            self._workspace_toggled()
+            _update_select_all_btn()
+
         add_op(
             "Rename sub_* functions (semantic naming)", self.v_rename_fn,
             "Runs dependency-aware bottom-up bulk function renamer across unnamed subroutines.",
+            _on_op_change,
         )
+        self.chk_fn_addr_row = tk.Frame(ops_list, bg=CARD)
+        self.chk_fn_addr_row.pack(fill="x", pady=(0, 2), padx=(22, 0))
+        self.chk_fn_addr = ttk.Checkbutton(
+            self.chk_fn_addr_row,
+            text="Append address suffix to function names (e.g. sub_100 → copyfile_100)",
+            variable=self.v_rename_fn_addr,
+        )
+        self.chk_fn_addr.pack(side="left")
+        make_help_badge(
+            self.chk_fn_addr_row,
+            "Preserves the function's unique address in its new name while applying AI semantic naming (<suggestedname_address>).",
+        ).pack(side="left", padx=6)
+
         add_op(
             "Rename local variables & parameters", self.v_rename_var,
             "Runs Hex-Rays local variable renamer on decompiled functions.",
+            _on_op_change,
         )
         self.ws_row = add_op(
             "Export OmniIDB AI workspace & context pack", self.v_workspace,
             "Produces offline AI workspace (decompiled code, disassembly, call graphs, strings, imports).",
-            self._workspace_toggled,
+            _on_ws_change,
         )
+        self._update_rename_fn_state()
+        _update_select_all_btn()
 
         # AI Investigation & Reporting (Mutually exclusive reporting workflow)
         ttk.Separator(ops_card).pack(fill="x", pady=(6, 8))
@@ -1225,7 +1460,7 @@ class OmniApp:
         r_ws.pack(fill="x", pady=2)
         self.rb_ws_analysis = ttk.Radiobutton(
             r_ws,
-            text="Exported Workspace AI Analysis (analyze exported native or .NET code -> MD report)",
+            text="Exported Workspace AI Analysis (analyze exported native or .NET code -> MD, HTML, PDF report)",
             variable=self.v_report_mode,
             value="workspace_analysis",
             command=self._report_mode_changed,
@@ -1306,7 +1541,7 @@ class OmniApp:
         # Row 1: IDA Executable + curved Browse button
         tk.Label(ida_grid, text="IDA Executable:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=0, column=0, pady=3, sticky="w")
         ttk.Entry(ida_grid, textvariable=self.v_ida).grid(row=0, column=1, sticky="ew", padx=(4, 6))
-        RoundedButton(ida_grid, "Browse...", command=lambda: self._pick_file(self.v_ida), bg_color=CARD, padx=8, pady=3, radius=6).grid(row=0, column=2)
+        RoundedButton(ida_grid, "Browse...", command=lambda: self._pick_file(self.v_ida, title="Select IDA Pro Executable"), bg_color=CARD, padx=8, pady=3, radius=6).grid(row=0, column=2)
 
         # Row 2: GoReSym Executable (for Go binaries)
         tk.Label(ida_grid, text="GoReSym Binary:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=1, column=0, pady=3, sticky="w")
@@ -1322,32 +1557,42 @@ class OmniApp:
         ).grid(row=0, column=1, padx=(6, 0))
         g_btns = tk.Frame(ida_grid, bg=CARD)
         g_btns.grid(row=1, column=2)
-        RoundedButton(g_btns, "Browse...", command=lambda: self._pick_file(self.v_goresym), bg_color=CARD, padx=6, pady=3, radius=6).pack(side="left", padx=(0, 4))
+        RoundedButton(g_btns, "Browse...", command=lambda: self._pick_file(self.v_goresym, title="Select GoReSym Binary"), bg_color=CARD, padx=6, pady=3, radius=6).pack(side="left", padx=(0, 4))
         self.btn_goresym_update = RoundedButton(g_btns, "⬇ Update", command=self._on_update_goresym, bg_color=CARD, padx=6, pady=3, radius=6)
         self.btn_goresym_update.pack(side="left")
 
-        # Row 3: AI Batch Size + hint
-        tk.Label(ida_grid, text="AI Batch Size:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=2, column=0, pady=(6, 0), sticky="w")
+        # Row 3: AI Batch Size + Concurrency (Workers)
+        tk.Label(ida_grid, text="AI Batch & Workers:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=2, column=0, pady=(6, 0), sticky="w")
         brow = tk.Frame(ida_grid, bg=CARD)
         brow.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Spinbox(brow, from_=1, to=50, textvariable=self.v_batch, width=5).pack(side="left")
-        make_help_badge(brow, "Sequential requests per IDA headless session to manage rate limits and memory.").pack(side="left", padx=6)
-        tk.Label(brow, text="Sequential requests per IDA session", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
+        ttk.Spinbox(brow, from_=1, to=50, textvariable=self.v_batch, width=4).pack(side="left")
+        make_help_badge(brow, "Number of functions grouped into each AI prompt (default 15). Larger batches significantly reduce API roundtrips.").pack(side="left", padx=(4, 8))
+        tk.Label(brow, text="Workers:", bg=CARD, fg=FG, font=UI_FONT_BOLD).pack(side="left")
+        ttk.Spinbox(brow, from_=1, to=8, textvariable=self.v_workers, width=3).pack(side="left", padx=(4, 0))
+        make_help_badge(brow, "Parallel AI request worker threads (1-8, default 3). Pre-extracts functions on IDA main thread, queries AI concurrently across workers, then safely applies names back in IDA.").pack(side="left", padx=(4, 8))
+        tk.Label(brow, text="threads", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
 
-        # Row 4: Rename Cache
-        tk.Label(ida_grid, text="Rename Cache:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=3, column=0, pady=(6, 0), sticky="w")
+        # Row 4: Low-score Rescan
+        tk.Label(ida_grid, text="Low-score Rescan:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=3, column=0, pady=(6, 0), sticky="w")
+        lsrow = tk.Frame(ida_grid, bg=CARD)
+        lsrow.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(lsrow, text="Enable low-score rescan (slow, re-analyzes ≤50% scores individually)", variable=self.v_low_score_rescan).pack(side="left")
+        make_help_badge(lsrow, "When unchecked (recommended), accepts wrapper names (wrap_*) to finish much faster. When checked, re-analyzes every low-scoring function one-by-one, which can be significantly slower.").pack(side="left", padx=6)
+
+        # Row 5: Rename Cache
+        tk.Label(ida_grid, text="Rename Cache:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=4, column=0, pady=(6, 0), sticky="w")
         crow = tk.Frame(ida_grid, bg=CARD)
-        crow.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        crow.grid(row=4, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(crow, text="Reuse function & variable names across samples", variable=self.v_cache).pack(side="left")
         make_help_badge(crow, "Cross-sample consensus cache: skips re-querying AI when identical or structurally matching decompiled code has already been analyzed.").pack(side="left", padx=6)
         RoundedButton(crow, "Clear Cache", command=self._on_clear_cache, bg_color=CARD, padx=6, pady=2, radius=4).pack(side="left", padx=(6, 6))
         self.cache_stats_lbl = tk.Label(crow, text=self._format_cache_stats(), bg=CARD, fg=DIM, font=SUB_FONT)
         self.cache_stats_lbl.pack(side="left")
 
-        # Row 5: Token Budget
-        tk.Label(ida_grid, text="Token Budget:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=4, column=0, pady=(6, 0), sticky="w")
+        # Row 6: Token Budget
+        tk.Label(ida_grid, text="Token Budget:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=5, column=0, pady=(6, 0), sticky="w")
         trow = tk.Frame(ida_grid, bg=CARD)
-        trow.grid(row=4, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        trow.grid(row=5, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Spinbox(trow, from_=0, to=10000000, increment=50000, textvariable=self.v_token_budget, width=10).pack(side="left")
         make_help_badge(trow, "Batch-wide token spending cap. 0 = unlimited. When exhausted, switches to free fallback or stops billable requests.").pack(side="left", padx=6)
         tk.Label(trow, text="Batch token cap (0 = unlimited)", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
@@ -1422,11 +1667,34 @@ class OmniApp:
             frame.grid(row=0, column=0, sticky="nsew")
             self.pages[key] = frame
 
-        self.queue_full = QueueView(self.pages["Queue"], compact=False, on_open_output=self.open_sample_output_folder)
+        self.queue_full = QueueView(
+            self.pages["Queue"],
+            compact=False,
+            on_open_output=self.open_sample_output_folder,
+            on_open_report=self.open_sample_report,
+            on_open_location=self.open_sample_location,
+            on_copy_path=self.copy_sample_path,
+            on_copy_md5=self.copy_sample_md5,
+            on_remove_sample=self.remove_sample_by_id,
+            on_sort=self._on_sort_column,
+            is_running_fn=lambda: self.running,
+        )
         self.queue_full.pack(fill="both", expand=True)
-        self.log_view = LogView(self.pages["Log"], activity_color, "Activity log is empty. Click 'Run OmniIDB' to start analysis.")
+        self.log_view = LogView(
+            self.pages["Log"],
+            activity_color,
+            "Activity log is empty. Click 'Run OmniIDB' to start analysis.",
+            on_clear=self._clear_logs,
+            on_save=lambda: self._save_log_to_file("Log"),
+        )
         self.log_view.pack(fill="both", expand=True)
-        self.ida_view = LogView(self.pages["IdaLog"], ida_color, "ida.log is empty. Live IDA Pro decompiler and loader output will stream here.")
+        self.ida_view = LogView(
+            self.pages["IdaLog"],
+            ida_color,
+            "ida.log is empty. Live IDA Pro decompiler and loader output will stream here.",
+            on_clear=self._clear_ida_logs,
+            on_save=lambda: self._save_log_to_file("IdaLog"),
+        )
         self.ida_view.pack(fill="both", expand=True)
 
         self._build_controls()
@@ -1445,13 +1713,14 @@ class OmniApp:
             font=SMALL_BTN_FONT, padx=8, pady=2, radius=6, bg_color=CARD,
         )
         clear_btn.pack(side="right", padx=(6, 0))
-        clear_btn.pack(side="right", padx=(6, 0))
 
         if tab == "Log":
+            RoundedButton(c, "Save...", command=lambda: self._save_log_to_file("Log"), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
             RoundedButton(c, "Copy", command=lambda: self._copy("\r\n".join(self.logs)), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
         if tab == "IdaLog":
+            RoundedButton(c, "Save...", command=lambda: self._save_log_to_file("IdaLog"), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
             RoundedButton(c, "Copy", command=lambda: self._copy("\r\n".join(self.ida_logs)), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
-        if tab == "Queue" and len(self.samples) > 1:
+        if tab == "Queue" and len(self.samples) >= 1:
             entry = ttk.Entry(c, textvariable=self.v_filter, width=14)
             entry.pack(side="right", padx=4)
             tk.Label(c, text="🔍 Filter:", bg=CARD, fg=MUTED, font=SUB_FONT).pack(side="right", padx=(4, 2))
@@ -1469,9 +1738,26 @@ class OmniApp:
         elif self.console_tab == "IdaLog":
             self._clear_ida_logs()
         elif self.console_tab == "Queue":
+            if self.running:
+                messagebox.showwarning(
+                    "Cannot Clear Queue",
+                    "Analysis is currently running. Stop analysis before clearing the queue.",
+                    parent=self.root,
+                )
+                return
+            if not self.samples:
+                return
+            if not messagebox.askyesno(
+                "Clear Sample Queue",
+                f"Remove all {len(self.samples)} sample(s) from the queue?",
+                parent=self.root,
+            ):
+                return
             self.samples.clear()
             self.v_queued.set("0 sample(s) queued")
             self._mark_queue()
+            self._build_controls()
+            self._update_tab_titles()
 
     def _sample_chips(self):
         s = self.samples
@@ -1490,12 +1776,20 @@ class OmniApp:
         return chips
 
     # ------------------------------------------------------------ actions
+    def _update_rename_fn_state(self) -> None:
+        if hasattr(self, "chk_fn_addr"):
+            if self.v_rename_fn.get():
+                self.chk_fn_addr.configure(state="normal")
+            else:
+                self.chk_fn_addr.configure(state="disabled")
+
     def toggle_select_all_ops(self) -> None:
         all_on = all([self.v_rename_fn.get(), self.v_rename_var.get(), self.v_workspace.get()])
         new_val = not all_on
         self.v_rename_fn.set(new_val)
         self.v_rename_var.set(new_val)
         self.v_workspace.set(new_val)
+        self._update_rename_fn_state()
         self._workspace_toggled()
         self.select_all_btn.set_text("Deselect All" if new_val else "Select All")
 
@@ -1530,7 +1824,7 @@ class OmniApp:
         if hasattr(self.ws_analysis_badge, "tooltip"):
             mode = "inspect the workspace directly" if direct else "analyze exported source and catalog evidence"
             self.ws_analysis_badge.tooltip.text = (
-                f"{provider} will {mode} and generate a Markdown malware research report. "
+                f"{provider} will {mode} and generate Markdown, HTML, and PDF malware research reports. "
                 "The configured fallback is used only if the primary fails. Selecting this mode automatically enables workspace export."
             )
         self.ws_analysis_badge.configure(fg=DIM)
@@ -1554,8 +1848,28 @@ class OmniApp:
         self.ida_view.clear()
         self._update_tab_titles()
 
+    def _save_log_to_file(self, tab: str) -> None:
+        lines = self.logs if tab == "Log" else self.ida_logs
+        if not lines:
+            messagebox.showinfo("Log Empty", f"The {tab} log is currently empty.", parent=self.root)
+            return
+        default_name = "activity.log" if tab == "Log" else "ida.log"
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title=f"Save {tab} to File",
+            initialfile=default_name,
+            defaultextension=".log",
+            filetypes=[("Log Files", "*.log"), ("Text Files", "*.txt"), ("All Files", "*.*")],
+        )
+        if path:
+            try:
+                Path(path).write_text("\n".join(lines), encoding="utf-8")
+                self._add_logs([f"[+] Log saved to {path}"])
+            except Exception as exc:
+                messagebox.showerror("Save Error", f"Could not save log file:\n{exc}", parent=self.root)
+
     def open_sample_output_folder(self, item_id: str) -> None:
-        """Open the target sample's output directory in Windows File Explorer."""
+        """Open the target sample's output directory in File Explorer."""
         try:
             idx = int(item_id)
             if 0 <= idx < len(self.samples):
@@ -1574,9 +1888,121 @@ class OmniApp:
                 target = Path(out_root) / folder
                 if not target.exists():
                     target.mkdir(parents=True, exist_ok=True)
-                os.startfile(str(target))
+                if sys.platform == "win32":
+                    os.startfile(str(target))
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", str(target)], check=False)
+                else:
+                    subprocess.run(["xdg-open", str(target)], check=False)
         except Exception as exc:
             messagebox.showerror("Error Opening Folder", f"Could not open output folder:\n{exc}", parent=self.root)
+
+    def open_sample_report(self, item_id: str, fmt: str = "html") -> None:
+        """Open the target sample's generated HTML or PDF report in the default system viewer."""
+        try:
+            idx = int(item_id)
+            if 0 <= idx < len(self.samples):
+                sample = self.samples[idx]
+                out_root = self.v_output.get().strip() or self.settings.output_root.strip()
+                if not out_root:
+                    messagebox.showinfo("No Output Directory", "Please specify an output directory first.", parent=self.root)
+                    return
+                from .runner import sanitize, sha256_file
+                digest = sha256_file(sample.path)
+                folder = f"{sanitize(sample.path.stem)}-{digest[:12]}"
+                target = Path(out_root) / folder
+                report_dir = target / "report"
+                ws_dir = target / "AI Workspace"
+
+                ext = ".html" if fmt.lower() == "html" else ".pdf"
+                candidates = [
+                    report_dir / f"report{ext}",
+                    report_dir / f"workspace_analysis{ext}",
+                    ws_dir / f"malware_analysis_report{ext}",
+                ]
+                found = None
+                for cand in candidates:
+                    if cand.is_file():
+                        found = cand
+                        break
+                if found:
+                    if sys.platform == "win32":
+                        os.startfile(str(found))
+                    elif sys.platform == "darwin":
+                        subprocess.run(["open", str(found)], check=False)
+                    else:
+                        subprocess.run(["xdg-open", str(found)], check=False)
+                else:
+                    messagebox.showinfo(
+                        "Report Not Found",
+                        f"No {fmt.upper()} report found for {sample.path.name} yet.\nRun the analysis with AI Investigation or Workspace Analysis enabled.",
+                        parent=self.root,
+                    )
+        except Exception as exc:
+            messagebox.showerror("Error Opening Report", f"Could not open report:\n{exc}", parent=self.root)
+
+    def open_sample_location(self, item_id: str) -> None:
+        """Open the sample's containing directory in File Explorer and select the file."""
+        try:
+            idx = int(item_id)
+            if 0 <= idx < len(self.samples):
+                sample = self.samples[idx]
+                p = sample.path.resolve()
+                if not p.exists():
+                    messagebox.showinfo("Sample Not Found", f"File does not exist:\n{p}", parent=self.root)
+                    return
+                if sys.platform == "win32":
+                    subprocess.run(["explorer.exe", f"/select,{str(p)}"], check=False)
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", "-R", str(p)], check=False)
+                else:
+                    subprocess.run(["xdg-open", str(p.parent)], check=False)
+        except Exception as exc:
+            messagebox.showerror("Error Opening Location", f"Could not open location:\n{exc}", parent=self.root)
+
+    def copy_sample_path(self, item_id: str) -> None:
+        try:
+            idx = int(item_id)
+            if 0 <= idx < len(self.samples):
+                self._copy(str(self.samples[idx].path))
+        except Exception:
+            pass
+
+    def copy_sample_md5(self, item_id: str) -> None:
+        try:
+            idx = int(item_id)
+            if 0 <= idx < len(self.samples):
+                md5 = getattr(self.samples[idx], "md5", "") or ""
+                if md5:
+                    self._copy(md5)
+        except Exception:
+            pass
+
+    def remove_sample_by_id(self, item_id: str) -> None:
+        if self.running:
+            messagebox.showwarning("Cannot Remove", "Cannot remove samples while analysis is running.", parent=self.root)
+            return
+        try:
+            idx = int(item_id)
+            if 0 <= idx < len(self.samples):
+                removed = self.samples.pop(idx)
+                self.v_queued.set(f"{len(self.samples)} sample(s) queued")
+                self._mark_queue()
+                self._build_controls()
+                self._update_tab_titles()
+                self._add_logs([f"[-] Removed from queue: {removed.path.name}"])
+        except Exception as exc:
+            messagebox.showerror("Error", f"Could not remove sample: {exc}", parent=self.root)
+
+    def _on_sort_column(self, col: str) -> None:
+        if self.sort_col == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col = col
+            self.sort_desc = False
+        self._mark_queue()
+        if hasattr(self, "queue_full"):
+            self.queue_full.update_sort_indicators(self.sort_col, self.sort_desc)
 
     def _agent_toggled(self) -> None:
         if self.v_agent.get():
@@ -1585,18 +2011,13 @@ class OmniApp:
             self.v_report_mode.set("none")
         self._report_mode_changed()
 
-    def _shellcode_toggled(self, rescan: bool = True) -> None:
-        self.arch_box.configure(state="readonly" if self.v_shellcode.get() else "disabled")
-        if rescan and self.v_input.get().strip():
-            self.refresh_samples()
-
-    def _pick_dir(self, var: tk.StringVar) -> None:
-        path = filedialog.askdirectory()
+    def _pick_dir(self, var: tk.StringVar, title: str = "Select Directory") -> None:
+        path = filedialog.askdirectory(title=title)
         if path:
             var.set(path)
 
-    def _pick_file(self, var: tk.StringVar) -> None:
-        path = filedialog.askopenfilename()
+    def _pick_file(self, var: tk.StringVar, title: str = "Select File", filetypes: tuple = (("Executable Files", "*.exe"), ("All Files", "*.*"))) -> None:
+        path = filedialog.askopenfilename(title=title, filetypes=filetypes)
         if path:
             var.set(path)
 
@@ -1604,10 +2025,10 @@ class OmniApp:
         try:
             from .rename_cache import cache_stats
             st = cache_stats(cache_path())
-            if not st or (st["function_entries"] == 0 and st["variable_entries"] == 0):
+            if not st or (st.get("function_entries", 0) == 0 and st.get("variable_entries", 0) == 0):
                 return "Cache is empty"
-            size_kb = st["file_bytes"] / 1024
-            return f"{st['function_entries']} fn, {st['variable_entries']} var ({size_kb:.1f} KB, {st['total_hits']} hits)"
+            size_kb = st.get("size_bytes", st.get("file_bytes", 0)) / 1024
+            return f"{st.get('function_entries', 0)} fn, {st.get('variable_entries', 0)} var ({size_kb:.1f} KB, {st.get('total_hits', 0)} hits)"
         except Exception:
             return ""
 
@@ -1682,12 +2103,11 @@ class OmniApp:
             filetypes=[
                 (
                     "Supported Targets (*.exe, *.dll, *.idb, *.i64, ...)",
-                    "*.exe;*.dll;*.sys;*.drv;*.ocx;*.cpl;*.scr;*.exe_;*.idb;*.i64;*.elf;*.so;*.dylib;*.bin;*.raw;*.sc;*.shellcode",
+                    "*.exe;*.dll;*.sys;*.drv;*.ocx;*.cpl;*.scr;*.exe_;*.idb;*.i64;*.elf;*.so;*.dylib",
                 ),
                 ("Windows Executables (*.exe, *.dll, *.sys, ...)", "*.exe;*.dll;*.sys;*.drv;*.ocx;*.cpl;*.scr;*.exe_"),
                 ("IDA Pro Databases (*.idb, *.i64)", "*.idb;*.i64"),
                 ("Linux & macOS Binaries (*.elf, *.so, *.dylib)", "*.elf;*.so;*.dylib"),
-                ("Raw Shellcode (*.bin, *.raw, *.sc, ...)", "*.bin;*.raw;*.sc;*.shellcode"),
                 ("All Files (*.*)", "*.*"),
             ],
         )
@@ -1768,6 +2188,7 @@ class OmniApp:
         if signed:
             if provider != "ChatGPTAccount":
                 keys.append("exe")
+            keys.append("signin")
         else:
             keys += ["url", "key"]
         keys.append("model")
@@ -1775,6 +2196,8 @@ class OmniApp:
             lab, widget = self.fb_rows[key]
             lab.grid(row=r, column=0, sticky="w", pady=2, padx=(0, 10))
             widget.grid(row=r, column=1, sticky="ew" if key != "provider" else "w", pady=2)
+        if signed:
+            self._build_signin(self.fb_rows["signin"][1], target="fallback")
 
     def _provider_layout(self) -> None:
         provider = self.v_provider.get()
@@ -1795,12 +2218,12 @@ class OmniApp:
             lab.grid(row=r, column=0, sticky="w", pady=2, padx=(0, 10))
             widget.grid(row=r, column=1, sticky="ew" if key != "provider" else "w", pady=2)
         if signed:
-            self._build_signin(self.ai_rows["signin"][1])
+            self._build_signin(self.ai_rows["signin"][1], target="main")
 
-    def _build_signin(self, holder: tk.Frame) -> None:
+    def _build_signin(self, holder: tk.Frame, target: str = "main") -> None:
         for child in holder.winfo_children():
             child.destroy()
-        provider = self.v_provider.get()
+        provider = self.v_fallback_provider.get() if target == "fallback" else self.v_provider.get()
         if provider == "ChatGPTAccount":
             btn = RoundedButton(
                 holder, "↗ Continue with ChatGPT in Browser", command=self.start_chatgpt,
@@ -1812,7 +2235,7 @@ class OmniApp:
         elif provider in ("ClaudeCode", "AntigravityCLI", "CopilotCLI"):
             name = "Claude" if provider == "ClaudeCode" else ("Copilot" if provider == "CopilotCLI" else "Antigravity")
             btn = RoundedButton(
-                holder, f"↗ Open {name} sign-in terminal", command=lambda: self._open_cli(name, ("auth",) if name == "Copilot" else ()),
+                holder, f"↗ Open {name} sign-in terminal", command=lambda n=name, t=target: self._open_cli(n, ("auth",) if n == "Copilot" else (), target=t),
                 bg_color=CARD, padx=10, pady=3, radius=6, font=SUB_FONT,
             )
             btn.pack(side="left")
@@ -1824,14 +2247,15 @@ class OmniApp:
                 tk.Label(holder, text=text, bg=CARD, fg=GREEN if signed else AMBER, font=UI_FONT_BOLD).pack(side="left", padx=(0, 8))
             btn = RoundedButton(
                 holder, "Re-authenticate" if signed else "Sign in with OpenCode",
-                command=lambda: self._open_cli("OpenCode", ("auth", "login")),
+                command=lambda t=target: self._open_cli("OpenCode", ("auth", "login"), target=t),
                 bg_color=CARD, padx=10, pady=3, radius=6, font=SUB_FONT,
             )
             btn.pack(side="left")
 
-    def _open_cli(self, name: str, args: tuple[str, ...] = ()) -> None:
+    def _open_cli(self, name: str, args: tuple[str, ...] = (), target: str = "main") -> None:
         try:
-            exe = self.v_exe.get().strip()
+            exe_var = self.v_fallback_exe if target == "fallback" else self.v_exe
+            exe = exe_var.get().strip()
             if not exe:
                 if name == "Claude":
                     exe = "claude"
@@ -1956,7 +2380,7 @@ class OmniApp:
             return
 
         try:
-            report = discover(target_path, s.recursive, s.output_root.strip() or None, s.allow_shellcode)
+            report = discover(target_path, s.recursive, s.output_root.strip() or None)
         except OSError as error:
             self.samples, self.rejected = [], []
             self._add_logs([f"Discovery error: {error}"])
@@ -1982,7 +2406,42 @@ class OmniApp:
             "Skipped": Sample.is_skipped,
         }
         pred = preds.get(mode, preds["All"])
-        return [(i, s) for i, s in enumerate(self.samples) if (not needle or needle in str(s.path).lower()) and pred(s)]
+
+        def matches_needle(s: Sample) -> bool:
+            if not needle:
+                return True
+            md5_val = (getattr(s, "md5", "") or "").lower()
+            return (
+                needle in s.path.name.lower()
+                or needle in str(s.path).lower()
+                or needle in md5_val
+                or needle in s.kind.label.lower()
+                or needle in s.status.lower()
+                or needle in s.stage.lower()
+            )
+
+        rows = [(i, s) for i, s in enumerate(self.samples) if matches_needle(s) and pred(s)]
+        if getattr(self, "sort_col", None):
+            col = self.sort_col
+            def sort_key(item: tuple[int, Sample]):
+                idx, s = item
+                if col == "n":
+                    return idx
+                if col == "name":
+                    return s.path.name.lower()
+                if col == "md5":
+                    return (getattr(s, "md5", "") or "").lower()
+                if col == "status":
+                    return (s.status.lower(), s.stage.lower())
+                if col == "time_spent":
+                    return s.elapsed_seconds if s.elapsed_seconds is not None else -1
+                if col == "type":
+                    return s.kind.label.lower()
+                if col == "size":
+                    return s.size
+                return idx
+            rows.sort(key=sort_key, reverse=getattr(self, "sort_desc", False))
+        return rows
 
     def _mark_queue(self) -> None:
         self.queue_dirty = True
@@ -2100,10 +2559,10 @@ class OmniApp:
             return
         self.logs.extend(lines)
         if len(self.logs) > MAX_LOGS:
-            del self.logs[:1000]
-            self.log_view.set_lines(self.logs)
-        else:
-            self.log_view.append(lines)
+            overflow = len(self.logs) - MAX_LOGS + 500
+            del self.logs[:overflow]
+            self.log_view.trim_top(overflow)
+        self.log_view.append(lines)
 
     def _poll(self) -> None:
         new_logs: list[str] = []
@@ -2117,10 +2576,10 @@ class OmniApp:
         if new_ida:
             self.ida_logs.extend(new_ida)
             if len(self.ida_logs) > MAX_IDA_LOGS:
-                del self.ida_logs[:2000]
-                self.ida_view.set_lines(self.ida_logs)
-            else:
-                self.ida_view.append(new_ida)
+                overflow = len(self.ida_logs) - MAX_IDA_LOGS + 1000
+                del self.ida_logs[:overflow]
+                self.ida_view.trim_top(overflow)
+            self.ida_view.append(new_ida)
         now = time.time()
         if self.running and (now - self._last_time_tick >= 0.15):
             self._last_time_tick = now
@@ -2192,9 +2651,15 @@ class OmniApp:
             self._set_running_ui(False)
             word = "Cancelled" if d["cancelled"] else "Finished"
             new_logs.append(f"--- Batch {word}: {d['succeeded']} succeeded, {d['failed']} failed ---")
+            if hasattr(self, "cache_stats_lbl"):
+                try:
+                    self.cache_stats_lbl.config(text=self._format_cache_stats())
+                except Exception:
+                    pass
         elif kind == "auth_finished":
             self.auth_running = False
             self._provider_layout()
+            self._fallback_layout()
             self._set_test_pill(d["ok"], "Sign-in complete." if d["ok"] else "Sign-in failed.")
             new_logs.append(d["message"])
         elif kind == "test_connection_result":

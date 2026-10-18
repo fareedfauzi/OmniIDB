@@ -162,8 +162,9 @@ def configure_provider(job, config):
     PROVIDER_INFO["active"] = worker["profile_name"]
     PROVIDER_INFO["used"] = [worker["profile_name"]]
     worker.update({
-        "batch_size": max(1, int(job.get("batch_size", 5))),
-        "parallel_workers": 1,
+        "batch_size": max(1, int(job.get("batch_size", 15))),
+        "parallel_workers": max(1, min(8, int(job.get("workers") or job.get("parallel_workers", 3)))),
+        "low_score_rescan": bool(job.get("low_score_rescan", False)),
         "cooldown_seconds": max(0, int(job.get("cooldown_seconds", 0))),
         "asm_max_lines": max(1, int(job.get("asm_max_lines", 25))),
         "force_bulk_rename": True,
@@ -297,6 +298,8 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
         return str(result or "").strip(), profile_name
 
     tracker = (job or {}).get("_tracker")
+    import threading
+    request_lock = threading.Lock()
 
     def request(cfg, prompt, sys_prompt, logger=None, on_chunk=None,
                 on_cooldown=None, max_tokens=None, cancel_checker=None, **kwargs):
@@ -306,33 +309,43 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
                 return ""
             profile_name = worker_cfg.get("profile_name", "OpenAI")
             api_url = worker_cfg.get("api_url") or ""
-            if tracker and not tracker.allowed(profile_name, api_url):
-                if switch_provider("token budget reached"):
-                    continue
-                from omni_idb.usage import BudgetExceeded
-                raise BudgetExceeded("Token budget reached (%d billable tokens)" % tracker.budget_tokens)
+            if tracker:
+                with request_lock:
+                    allowed = tracker.allowed(profile_name, api_url)
+                if not allowed:
+                    with request_lock:
+                        switched = switch_provider("token budget reached")
+                    if switched:
+                        continue
+                    from omni_idb.usage import BudgetExceeded
+                    raise BudgetExceeded("Token budget reached (%d billable tokens)" % tracker.budget_tokens)
             try:
                 result, profile_name = dispatch(cfg, prompt, sys_prompt, logger, on_chunk, max_tokens, cancel_checker)
             except Exception as exc:  # noqa: BLE001 - any provider failure may trigger the fallback
                 lowered = str(exc).lower()
                 permanent = any(t in lowered for t in ("context length", "context window", "maximum context", "prompt is too long", "too many tokens"))
-                if not permanent and switch_provider("%s: %s" % (type(exc).__name__, exc)):
+                with request_lock:
+                    switched = switch_provider("%s: %s" % (type(exc).__name__, exc))
+                if not permanent and switched:
                     continue
                 raise
             if not result and not (cancel_checker and cancel_checker()):
                 # Quota/auth failures often surface as empty replies on CLI providers.
                 # Retry this request on the fallback instead of returning a lost result.
-                if switch_provider("empty response"):
+                with request_lock:
+                    switched = switch_provider("empty response")
+                if switched:
                     continue
             if tracker and result:
                 try:
-                    tracker.record(
-                        provider=profile_name,
-                        model=worker_cfg.get("model") or "default",
-                        api_url=api_url,
-                        input_text=(sys_prompt or "") + "\n\n" + (prompt or ""),
-                        output_text=result,
-                    )
+                    with request_lock:
+                        tracker.record(
+                            provider=profile_name,
+                            model=worker_cfg.get("model") or "default",
+                            api_url=api_url,
+                            input_text=(sys_prompt or "") + "\n\n" + (prompt or ""),
+                            output_text=result,
+                        )
                 except Exception:
                     pass
             if on_chunk and result and profile_name != "ChatGPTAccount":
@@ -522,6 +535,30 @@ def detect_protectors_and_packers():
         if len(sample_strings) >= 2000:
             break
 
+    def match_sec(marker: str, section_name: str) -> bool:
+        # Match section names without substring false positives.
+        # Compare normalized section names (e.g. '.upx0' or 'upx0')
+        s_clean = section_name.lower().strip()
+        m_clean = marker.lower().strip()
+        if s_clean == m_clean:
+            return True
+        # If marker starts with dot, also match without leading dot
+        if m_clean.startswith(".") and s_clean == m_clean[1:]:
+            return True
+        if not m_clean.startswith(".") and s_clean == "." + m_clean:
+            return True
+        # Allow numbered suffix matches like 'upx0', 'upx1', 'mpress1' if marker ends with wildcard or prefix
+        if m_clean in (".upx", "upx", ".mpress", "mpress", ".nsp", "nsp", ".aspack", "aspack", ".vmp", "vmp", ".themida", "themida", ".enigma", "enigma"):
+            prefix = m_clean.lstrip(".")
+            s_noprefix = s_clean.lstrip(".")
+            if s_noprefix.startswith(prefix) and s_noprefix[len(prefix):].isdigit():
+                return True
+        return False
+
+    def match_marker(marker: str, target: str) -> bool:
+        # Match whole word to avoid substring false positives (e.g. 'mpress' in 'compress', 'petite' in 'appetite')
+        return bool(re.search(r'(?<![a-zA-Z0-9_])' + re.escape(marker) + r'(?![a-zA-Z0-9_])', target))
+
     # 1. Code Virtualizers & Heavy Commercial Protectors
     virtualizers = [
         ("VMProtect", (".vmp0", ".vmp1", ".vmp2", "vmp0", "vmp1", "vmp2"), ("vmprotect",)),
@@ -536,8 +573,8 @@ def detect_protectors_and_packers():
     ]
 
     for name, sec_markers, str_markers in virtualizers:
-        hit_secs = [s for s in seg_names if any(m in s for m in sec_markers)]
-        hit_strs = [m for m in str_markers if any(m in s for s in sample_strings)]
+        hit_secs = [s for s in seg_names if any(match_sec(m, s) for m in sec_markers)]
+        hit_strs = [m for m in str_markers if any(match_marker(m, s) for s in sample_strings)]
         if hit_secs or hit_strs:
             detail = ("sections: %s" % ", ".join(hit_secs)) if hit_secs else ("string: '%s'" % hit_strs[0])
             findings.append(("Code Virtualization", "%s (%s)" % (name, detail)))
@@ -574,8 +611,8 @@ def detect_protectors_and_packers():
 
     if not any(f[0] == "Code Virtualization" for f in findings):
         for name, sec_markers, str_markers in packers:
-            hit_secs = [s for s in seg_names if any(m in s for m in sec_markers)]
-            hit_strs = [m for m in str_markers if any(m in s for s in sample_strings)]
+            hit_secs = [s for s in seg_names if any(match_sec(m, s) for m in sec_markers)]
+            hit_strs = [m for m in str_markers if any(match_marker(m, s) for s in sample_strings)]
             if hit_secs or hit_strs:
                 detail = ("sections: %s" % ", ".join(hit_secs)) if hit_secs else ("string: '%s'" % hit_strs[0])
                 findings.append(("Packed", "%s (%s)" % (name, detail)))
@@ -595,7 +632,7 @@ def detect_protectors_and_packers():
     ]
 
     for name, str_markers in dotnet_obfuscators:
-        hit_strs = [m for m in str_markers if any(m in s for s in sample_strings)]
+        hit_strs = [m for m in str_markers if any(match_marker(m, s) for s in sample_strings)]
         if hit_strs:
             findings.append(("Obfuscated .NET", "%s (detected '%s')" % (name, hit_strs[0])))
             break
@@ -717,55 +754,6 @@ def collect_sub_functions(renamer):
     return result
 
 
-def configure_raw_shellcode(job):
-    """Apply the architecture metadata missing from a raw byte stream."""
-    if job.get("sample_kind") != "shellcode":
-        return
-
-    import ida_auto
-    import ida_funcs
-    import ida_ida
-    import ida_idaapi
-    import ida_segment
-    import idaapi
-
-    arch = str(job.get("shellcode_arch") or "x64").lower()
-    if arch not in ("x86", "x64"):
-        raise RuntimeError("Unsupported raw shellcode architecture: %s" % arch)
-    bits = 64 if arch == "x64" else 32
-    segment_bitness = 2 if bits == 64 else 1
-
-    try:
-        ida_ida.inf_set_app_bitness(bits)
-    except (AttributeError, TypeError):
-        # Compatibility with IDA releases exposing the information structure.
-        idaapi.get_inf_structure().set_app_bitness(bits)
-
-    segment = ida_segment.get_first_seg()
-    first_ea = ida_idaapi.BADADDR
-    last_ea = ida_idaapi.BADADDR
-    while segment:
-        ida_segment.set_segm_addressing(segment, segment_bitness)
-        if first_ea == ida_idaapi.BADADDR:
-            first_ea = int(segment.start_ea)
-        last_ea = int(segment.end_ea)
-        segment = ida_segment.get_next_seg(segment.start_ea)
-
-    if first_ea == ida_idaapi.BADADDR:
-        raise RuntimeError("IDA's binary loader did not create a segment for the shellcode")
-
-    # Raw blobs have no entry-point table. Seed a function at the first byte so
-    # Genesect has a sub_* root to analyze and IDA can follow reachable code.
-    ida_funcs.add_func(first_ea, ida_idaapi.BADADDR)
-    if last_ea != ida_idaapi.BADADDR:
-        ida_auto.plan_range(first_ea, last_ea)
-    emit(
-        "stage",
-        "Configured raw %s shellcode at 0x%X" % (arch, first_ea),
-        stage="shellcode",
-    )
-
-
 def all_existing_names():
     import idautils
     import idc
@@ -776,7 +764,7 @@ def all_existing_names():
     }
 
 
-def apply_function_name(ea, name):
+def apply_function_name(ea, name, append_address=False):
     import idaapi
     import ida_hexrays
     import ida_name
@@ -784,15 +772,23 @@ def apply_function_name(ea, name):
     from genesect.idb_storage import load_from_idb, save_to_idb
 
     original = load_from_idb(ea, tag=82)
+    current = idc.get_func_name(ea)
     if not original:
-        current = idc.get_func_name(ea)
         if current and not current.startswith("sub_"):
             save_to_idb(ea, current, tag=82)
     candidate = str(name)
+    if append_address:
+        # Determine address suffix matching IDA convention (e.g. sub_100 -> 100, or hex EA without 0x)
+        addr_str = current[4:] if (current and current.startswith("sub_")) else ("%X" % ea)
+        if addr_str:
+            suffix_pattern = "_" + addr_str.lower()
+            if not candidate.lower().endswith(suffix_pattern):
+                candidate = "%s_%s" % (candidate, addr_str)
+    base_candidate = candidate
     owner = idc.get_name_ea_simple(candidate)
     suffix = 1
     while owner != idaapi.BADADDR and owner != ea:
-        candidate = "%s_%d" % (name, suffix)
+        candidate = "%s_%d" % (base_candidate, suffix)
         suffix += 1
         owner = idc.get_name_ea_simple(candidate)
     ok = ida_name.set_name(ea, candidate, ida_name.SN_NOWARN | ida_name.SN_FORCE)
@@ -805,7 +801,7 @@ def apply_function_name(ea, name):
     return bool(ok), candidate
 
 
-def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None):
+def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None, append_address=False):
     emit("stage", "Renaming functions", stage="functions")
     import idaapi
     import idc
@@ -833,7 +829,7 @@ def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None):
             hit = cache.lookup_function(fp)
             if hit:
                 hit_name, match_type = hit
-                ok, final_name = apply_function_name(func.ea, hit_name)
+                ok, final_name = apply_function_name(func.ea, hit_name, append_address=append_address)
                 if ok:
                     renamed += 1
                     cache_hits += 1
@@ -878,21 +874,68 @@ def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None):
             total=len(sub_functions),
         )
         results = []
+        batch_sz = max(1, int(cfg.get("batch_size") or 15))
+        num_workers = max(1, min(8, int(cfg.get("parallel_workers") or cfg.get("workers") or 3)))
+        allow_rescan = bool(cfg.get("low_score_rescan", False))
+
         worker = renamer.AnalyzeWorker(
             cfg, ready, existing,
-            renamer.DEFAULT_BATCH_PROMPT if cfg["batch_size"] > 1 else renamer.DEFAULT_PROMPT,
-            cfg["batch_size"], is_retry=True,
+            renamer.DEFAULT_BATCH_PROMPT if batch_sz > 1 else renamer.DEFAULT_PROMPT,
+            batch_sz, is_retry=True,
+            is_low_score_rescan=not allow_rescan,
         )
+        if not allow_rescan:
+            # Bypass single-function rescan cascade for significantly faster processing
+            worker._rescan_low_score_results = lambda res: res
+
         worker.batch_done.connect(lambda batch: results.extend(batch))
         worker.log.connect(lambda message, level: emit("log", message, level=level))
         worker.update_status.connect(lambda message: emit("log", message) if message else None)
-        worker.run()
+
+        batches = [ready[i:i + batch_sz] for i in range(0, len(ready), batch_sz)]
+
+        if num_workers > 1 and len(batches) > 1:
+            import concurrent.futures
+            import threading
+
+            emit("log", "Processing %d batch(es) in parallel across %d worker threads (batch size %d)..." % (
+                len(batches), min(num_workers, len(batches)), batch_sz), level="info")
+            existing_lock = threading.Lock()
+            orig_process_batch = worker.process_batch
+
+            def _process_one_batch(b):
+                if not getattr(worker, "running", True):
+                    return []
+                res = orig_process_batch(b)
+                if allow_rescan and not getattr(worker, "is_low_score_rescan", False):
+                    res = worker._rescan_low_score_results(res)
+                with existing_lock:
+                    for _idx, _f, _name, _score in res:
+                        if _name and _name not in ("DEFERRED", "DEFERRED_LOW_SCORE"):
+                            worker.existing.add(_name)
+                return res
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_workers, len(batches))) as executor:
+                futures = [executor.submit(_process_one_batch, b) for b in batches]
+                done_count = 0
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        b_res = f.result()
+                        if b_res:
+                            results.extend(b_res)
+                            done_count += len(b_res)
+                            emit("progress", "Batch completed (%d/%d functions in round)" % (done_count, len(ready)),
+                                 stage="functions", current=len(sub_functions) - len(pending) + done_count, total=len(sub_functions))
+                    except Exception as e:
+                        emit("log", "Parallel batch error: %s" % e, level="error")
+        else:
+            worker.run()
 
         processed = set()
         for _index, func, suggestion, score in results:
             processed.add(func.ea)
             if suggestion and suggestion not in ("DEFERRED", "DEFERRED_LOW_SCORE"):
-                ok, final_name = apply_function_name(func.ea, suggestion)
+                ok, final_name = apply_function_name(func.ea, suggestion, append_address=append_address)
                 if ok:
                     renamed += 1
                     existing.add(final_name)
@@ -1337,7 +1380,12 @@ def save_original_idb(job):
     target.parent.mkdir(parents=True, exist_ok=True)
     emit("stage", "Saving original IDB before AI changes", stage="save")
     if not ida_loader.save_database(str(target), ida_loader.DBFL_COMP):
-        raise RuntimeError("IDA could not save the original database to %s" % target)
+        alt_ext = ".idb" if str(target).lower().endswith(".i64") else ".i64"
+        alt_target = target.with_suffix(alt_ext)
+        if not ida_loader.save_database(str(alt_target), ida_loader.DBFL_COMP):
+            raise RuntimeError("IDA could not save the original database to %s" % target)
+        target = alt_target
+        job["original_idb_path"] = str(alt_target)
     emit("log", "Original IDB saved: %s" % target, level="ok")
     return str(target)
 
@@ -1739,6 +1787,11 @@ def run_workspace_analysis(job, cfg, renamer, workspace_path):
         "## 6. Output Format\n"
         "- Output the ENTIRE full, complete technical research report directly in Markdown format.\n"
         "- Do NOT write just a brief summary or redirect to an artifact file; output the entire comprehensive document from title to conclusions.\n\n"
+        "## 7. Mandatory IDB Navigation Section\n"
+        "- At the end of the report, you MUST include a dedicated section titled '## Key Functions for Reverse Engineering & IDB Navigation'.\n"
+        "- Present a markdown table with columns: | Address | Function Name | Original Name | Classification | Assessment & What to Inspect in IDB |\n"
+        "- Classify each function as Malicious, Suspicious, or Core Functionality (include both renamed functions and unnamed sub_* routines).\n"
+        "- In 'Assessment & What to Inspect in IDB', provide concrete instructions for reverse engineers navigating the IDB in IDA Pro (e.g., F5 decompile hints, cross-references, API parameters, decryption loops).\n\n"
         "Write the publication-quality malware research report now in Markdown format:"
     ) % str(ws.resolve())
 
@@ -1765,6 +1818,12 @@ def run_workspace_analysis(job, cfg, renamer, workspace_path):
         emit("log", "Workspace analysis returned empty report.", level="warning")
         return None
 
+    try:
+        from omni_idb.workspace_analysis import ensure_report_navigation
+        report_text = ensure_report_navigation(report_text, ws, is_dotnet=False, renamed_list=RENAMED)
+    except Exception as exc:
+        emit("log", "Note: Navigation table check skipped: %s" % exc, level="debug")
+
     out_file = ws / "malware_analysis_report.md"
     out_file.write_text(report_text, encoding="utf-8")
     emit("log", "Malware analysis report saved to: %s" % out_file, level="ok")
@@ -1774,6 +1833,47 @@ def run_workspace_analysis(job, cfg, renamer, workspace_path):
         r_file = r_dir / "workspace_analysis.md"
         r_file.write_text(report_text, encoding="utf-8")
         emit("log", "Workspace analysis mirrored to: %s" % r_file, level="ok")
+
+    try:
+        from omni_idb import reporting
+        sample_path_str = str(job.get("sample_path") or "sample")
+        sample_meta = {
+            "filename": Path(sample_path_str).name,
+            "sha256": job.get("sample_sha256") or "",
+            "file_type": job.get("sample_kind", "binary"),
+        }
+        model_meta = {
+            "sample": sample_meta,
+            "category": "Malware Analysis Report",
+            "provider": {"used": [provider] if provider else []},
+            "badges": ["Exported AI Workspace", provider] if provider else ["Exported AI Workspace"],
+        }
+        reporting.render_markdown_deliverables(
+            report_text,
+            ws,
+            model=model_meta,
+            base_name="malware_analysis_report",
+            log_fn=lambda m: emit("log", m),
+        )
+        if job.get("report_dir"):
+            r_dir = Path(job["report_dir"])
+            reporting.render_markdown_deliverables(
+                report_text,
+                r_dir,
+                model=model_meta,
+                base_name="workspace_analysis",
+                log_fn=lambda m: emit("log", m),
+            )
+            reporting.render_markdown_deliverables(
+                report_text,
+                r_dir,
+                model=model_meta,
+                base_name="report",
+                log_fn=lambda m: emit("log", m),
+            )
+    except Exception as render_exc:
+        emit("log", "Note: Deliverables will be finalized by host process (%s)" % render_exc, level="info")
+
     return str(out_file)
 
 
@@ -1792,7 +1892,6 @@ def main():
     from genesect.config import CONFIG
     from genesect import renamer, var_renamer
 
-    configure_raw_shellcode(job)
     emit("stage", "Waiting for IDA auto-analysis", stage="ida")
     ida_auto.auto_wait()
     original_idb = save_original_idb(job)
@@ -1917,7 +2016,10 @@ def main():
                 filtered_subs = filter_high_signal_sub_functions(sub_functions, renamer, max_ceiling=25)
                 sub_functions = filtered_subs
 
-            result["function_rename"] = run_function_rename(sub_functions, cfg, renamer, cache=cache, tracker=tracker)
+            append_addr = bool(job.get("rename_functions_with_address"))
+            result["function_rename"] = run_function_rename(
+                sub_functions, cfg, renamer, cache=cache, tracker=tracker, append_address=append_addr
+            )
 
     if job.get("rename_variables"):
         if is_virtualized or is_packed or is_obfuscated_dotnet:
@@ -2010,7 +2112,13 @@ def main():
     Path(idb_path).parent.mkdir(parents=True, exist_ok=True)
     emit("stage", "Saving analyzed IDB", stage="save")
     if not ida_loader.save_database(idb_path, ida_loader.DBFL_COMP):
-        raise RuntimeError("IDA could not save database to %s" % idb_path)
+        alt_ext = ".idb" if idb_path.lower().endswith(".i64") else ".i64"
+        alt_path = str(Path(idb_path).with_suffix(alt_ext))
+        if not ida_loader.save_database(alt_path, ida_loader.DBFL_COMP):
+            raise RuntimeError("IDA could not save database to %s" % idb_path)
+        idb_path = alt_path
+        job["idb_path"] = alt_path
+    result["idb_path"] = idb_path
 
     result_path = Path(job["result_path"])
     result_path.parent.mkdir(parents=True, exist_ok=True)

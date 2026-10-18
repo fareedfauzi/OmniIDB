@@ -33,6 +33,7 @@ KEYLESS_PROVIDERS = {"Ollama", "LMStudio"}
 
 # provider -> (api_url, model, executable)
 _PROVIDER_DEFAULTS = {
+    "OpenAI": ("https://api.openai.com/v1", "gpt-5.1", ""),
     "Anthropic": ("https://api.anthropic.com", "claude-sonnet-4-5", ""),
     "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat", ""),
     "GoogleGemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash", ""),
@@ -170,9 +171,10 @@ def find_genesect_package_root(*hints: Path | str) -> Optional[Path]:
         p = Path(text)
         candidates += [p, p / "plugins", p.parent / "plugins"]
     candidates += [project_root(), project_root().parent]
-    for name in ("IDA Professional", "IDA Pro"):
-        for version in ("9.3", "9.2", "9.1", "9.0", "8.4", "8.3"):
+    for name in ("IDA Professional", "IDA Pro", "IDA Home", "IDA Free"):
+        for version in ("9.3", "9.2", "9.1", "9.0", "8.4", "8.3", "8.2", "8.1", "8.0", "7.7", "7.6", "7.5"):
             candidates.append(Path(rf"C:\Program Files\{name} {version}\plugins"))
+            candidates.append(Path(rf"C:\Program Files (x86)\{name} {version}\plugins"))
     for candidate in candidates:
         if (candidate / "genesect" / "__init__.py").is_file():
             return candidate
@@ -185,19 +187,34 @@ def detect_engine_root() -> Optional[Path]:
         for directory in [start, *list(start.parents)[:8]]:
             if runner_script(directory).is_file():
                 return directory
-    plugin = Path(r"C:\Program Files\IDA Professional 9.3\plugins")
-    if (plugin / "genesect").is_dir():
-        return plugin
+    for version in ("9.3", "9.2", "9.1", "9.0", "8.4", "8.3"):
+        plugin = Path(rf"C:\Program Files\IDA Professional {version}\plugins")
+        if (plugin / "genesect").is_dir():
+            return plugin
     return None
 
 
 def detect_ida() -> Optional[Path]:
-    names = ["IDA Professional", "IDA Pro"]
-    for version in ("9.3", "9.2", "9.1", "9.0"):
+    import shutil
+    for exe in ("ida.exe", "ida64.exe", "ida", "ida64"):
+        found = shutil.which(exe)
+        if found and Path(found).is_file():
+            return Path(found)
+
+    names = ["IDA Professional", "IDA Pro", "IDA Home", "IDA Free", "IDA"]
+    versions = ("9.3", "9.2", "9.1", "9.0", "8.4", "8.3", "8.2", "8.1", "8.0", "7.7", "7.6", "7.5", "7.0")
+    for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
+        for version in versions:
+            for name in names:
+                for exe in ("ida.exe", "ida64.exe"):
+                    candidate = Path(rf"{base}\{name} {version}\{exe}")
+                    if candidate.is_file():
+                        return candidate
         for name in names:
-            candidate = Path(rf"C:\Program Files\{name} {version}\ida.exe")
-            if candidate.is_file():
-                return candidate
+            for exe in ("ida.exe", "ida64.exe"):
+                candidate = Path(rf"{base}\{name}\{exe}")
+                if candidate.is_file():
+                    return candidate
     return None
 
 
@@ -212,6 +229,7 @@ class AppSettings:
     model: str = "gpt-5.1"
     executable: str = ""
     rename_functions: bool = True
+    rename_functions_with_address: bool = False
     rename_variables: bool = True
     generate_workspace: bool = False
     analyze_workspace: bool = False
@@ -220,9 +238,9 @@ class AppSettings:
     goresym_path: str = ""
     investigation_turns: int = 10
     recursive: bool = True
-    allow_shellcode: bool = False
-    shellcode_arch: str = "x64"
-    batch_size: int = 5
+    batch_size: int = 15
+    workers: int = 3
+    low_score_rescan: bool = False
     cooldown_seconds: int = 0
     use_rename_cache: bool = True
     token_budget: int = 0

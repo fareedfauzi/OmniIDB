@@ -166,7 +166,7 @@ SYNTHESIS_SCHEMA_HINT = """{
   "conclusion": "short concluding paragraph",
   "execution_flow": [{"stage": "step name", "description": "what happens", "evidence": "function/API/string"}],
   "capabilities": [{"name": "capability", "description": "what the evidence supports", "evidence": "function/API/string"}],
-  "key_functions": [{"name": "function name", "address": "0x...", "verdict": "benign|interesting|suspicious|malicious", "summary": "purpose", "behaviors": ["..."]}],
+  "key_functions": [{"name": "function name (renamed or sub_*)", "address": "0x...", "original_name": "sub_... if renamed", "verdict": "Malicious|Suspicious|Core Functionality", "summary": "purpose & assessment", "triage_guidance": "what specific code/APIs/loops/strings to inspect in IDA", "behaviors": ["..."]}],
   "iocs": [{"type": "url|ipv4|domain|file_path|registry|mutex|command_line|other", "value": "exact string from evidence", "role": "e.g. c2, dropped file, persistence key", "context": "where/how used"}],
   "mitre": [{"tactic": "...", "technique": "...", "id": "T1055", "evidence": "..."}],
   "analysis_gaps": ["what could not be determined"],
@@ -272,7 +272,7 @@ def fallback_synthesis(facts: Dict[str, Any]) -> Dict[str, Any]:
 def assemble_model(
     facts: Dict[str, Any],
     synthesis: Optional[Dict[str, Any]],
-    investigation: Optional[Dict[str, Any]],
+    investigation: Optional[Dict[str, Any]] = None,
     provider_info: Optional[Dict[str, Any]] = None,
     synthesis_status: str = "ok",
 ) -> Dict[str, Any]:
@@ -304,13 +304,78 @@ def assemble_model(
         "provider": dict(provider_info or {}),
         "synthesis_status": synthesis_status,
     }
-    # Add per-function facts (APIs / addresses) the AI cannot be trusted to copy exactly.
+    # Add per-function facts (APIs / addresses / original names) and guarantee IDB navigation coverage.
     facts_by_name = {f.get("name"): f for f in facts.get("key_functions", [])}
+    facts_by_addr = {str(f.get("address", "")).lower(): f for f in facts.get("key_functions", [])}
+    renamed_list = facts.get("renamed_functions") or facts.get("functions_renamed") or []
+    renamed_by_addr = {str(r.get("address", "")).lower(): r for r in renamed_list}
+    renamed_by_new = {str(r.get("new", "")).lower(): r for r in renamed_list}
+
+    existing_addrs = set()
     for fn in model["key_functions"]:
-        src = facts_by_name.get(fn.get("name"))
+        name = fn.get("name") or ""
+        addr = fn.get("address") or ""
+        src = facts_by_name.get(name) or facts_by_addr.get(addr.lower())
         if src:
             fn.setdefault("address", src.get("address", ""))
             fn["apis"] = src.get("api_calls", [])[:12]
+        
+        cur_addr = str(fn.get("address") or "").lower()
+        r_item = renamed_by_addr.get(cur_addr) or renamed_by_new.get(name.lower())
+        if r_item and r_item.get("old"):
+            fn["original_name"] = r_item["old"]
+        else:
+            fn["original_name"] = name if name.startswith("sub_") else "-"
+        
+        v = str(fn.get("verdict") or "").strip().lower()
+        if "mal" in v:
+            fn["verdict"] = "Malicious"
+        elif "core" in v:
+            fn["verdict"] = "Core Functionality"
+        elif "susp" in v or "inter" in v:
+            fn["verdict"] = "Suspicious"
+        else:
+            fn["verdict"] = "Suspicious"
+
+        if cur_addr:
+            existing_addrs.add(cur_addr)
+
+    # If key_functions is missing or sparse, populate from facts deterministically
+    for kf in facts.get("key_functions", [])[:15]:
+        addr = str(kf.get("address") or "").lower()
+        if addr in existing_addrs:
+            continue
+        name = kf.get("name") or ("sub_" + addr.lstrip("0x"))
+        r_item = renamed_by_addr.get(addr) or renamed_by_new.get(name.lower())
+        orig_name = r_item.get("old") if r_item else (name if name.startswith("sub_") else "-")
+        apis = kf.get("api_calls", [])
+        
+        apis_lower = [str(a).lower() for a in apis]
+        is_mal = any(any(m in a for m in ("virtualallocex", "writeprocessmemory", "createremotethread", "queueuserapc", "setthreadcontext", "ptrace", "adjusttokenprivileges", "getasynckeystate", "setwindowshookex")) for a in apis_lower)
+        is_susp = any(any(m in a for m in ("virtualalloc", "virtualprotect", "loadlibrary", "getprocaddress", "crypt", "aes", "socket", "connect", "internetopen", "regsetvalue", "createservice", "isdebuggerpresent", "ntqueryinformationprocess")) for a in apis_lower)
+        verdict = "Malicious" if is_mal else ("Suspicious" if is_susp else "Core Functionality")
+        
+        guidance_parts = []
+        if apis:
+            guidance_parts.append("Calls: " + ", ".join(f"`{a}`" for a in apis[:4]))
+        if kf.get("strings"):
+            guidance_parts.append("Strings: " + ", ".join(f'"{s}"' for s in kf["strings"][:2]))
+        if not guidance_parts:
+            guidance_parts.append("Key execution branch (%d calls)" % len(kf.get("calls", [])))
+        guidance = ". ".join(guidance_parts) + ". Inspect subroutine flow in IDA."
+        
+        model["key_functions"].append({
+            "name": name,
+            "address": kf.get("address", ""),
+            "original_name": orig_name,
+            "verdict": verdict,
+            "summary": "High-signal subroutine (score: %.1f)" % kf.get("score", 0),
+            "triage_guidance": guidance,
+            "apis": apis[:12],
+            "behaviors": [],
+        })
+        existing_addrs.add(addr)
+
     return finalize_model(model)
 
 

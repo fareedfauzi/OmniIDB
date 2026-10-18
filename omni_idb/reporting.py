@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import report_model as rm
 
-VERDICTS = {"benign", "interesting", "suspicious", "malicious"}
+VERDICTS = {"benign", "interesting", "suspicious", "malicious", "core functionality", "core"}
 
 
 # ---------------------------------------------------------------- markdown
@@ -102,18 +102,7 @@ def render_markdown(model: Dict[str, Any]) -> str:
             section("Capabilities", 3)
             L.extend(_table(["Capability", "What the evidence supports", "Evidence"],
                             [[c.get("name"), c.get("description"), c.get("evidence")] for c in model["capabilities"]]))
-        if model.get("key_functions"):
-            section("Key Functions", 3)
-            L.extend(_table(["Function", "Address", "Verdict", "Summary"],
-                            [[f.get("name"), f.get("address"), f.get("verdict"), f.get("summary")] for f in model["key_functions"]]))
-            for fn in model["key_functions"]:
-                extras = []
-                if fn.get("behaviors"):
-                    extras.append("- **Behaviors**: " + "; ".join(_md(b) for b in fn["behaviors"]))
-                if fn.get("apis"):
-                    extras.append("- **APIs**: " + ", ".join("`%s`" % a for a in fn["apis"]))
-                if extras:
-                    L.extend(["#### %s (%s)" % (_md(fn.get("name")), _md(fn.get("address", ""))), ""] + extras + [""])
+
 
     if model.get("conclusion"):
         section("Conclusion")
@@ -142,6 +131,49 @@ def render_markdown(model: Dict[str, Any]) -> str:
         section("MITRE ATT&CK Mappings")
         L.extend(_table(["Tactic", "Technique", "ID", "Evidence"],
                         [[m.get("tactic"), m.get("technique"), m.get("id"), m.get("evidence")] for m in model["mitre"]]))
+
+    if model.get("key_functions"):
+        is_dn = bool(
+            model.get("is_dotnet")
+            or "dotnet" in str(sample.get("file_type", "")).lower()
+            or any(f.get("type_namespace") for f in model["key_functions"])
+        )
+        if is_dn:
+            section("Key Methods for Decompiler Navigation (dnSpy / ILSpy)")
+            L.append("The following table prioritizes critical managed classes and methods for reverse engineers to inspect in dnSpy or ILSpy. Use the method tokens or locations to locate decompiled logic.")
+            L.append("")
+            headers = ["Type / Namespace", "Method Name", "Location / Token", "Classification", "Assessment & What to Inspect in Decompiler"]
+            rows = []
+            for f in model["key_functions"]:
+                t_ns = "`%s`" % _md(f.get("type_namespace") or f.get("namespace") or "-")
+                fn_name = "`%s`" % _md(f.get("name", ""))
+                loc = "`%s`" % _md(f.get("location") or f.get("token") or f.get("address") or "-")
+                verd = f.get("verdict") or "Suspicious"
+                guidance = f.get("triage_guidance") or f.get("summary") or "Inspect method logic in decompiler."
+                rows.append([t_ns, fn_name, loc, verd, guidance])
+            L.extend(_table(headers, rows))
+        else:
+            section("Key Functions for Reverse Engineering & IDB Navigation")
+            L.append("The following table prioritizes critical subroutines for reverse engineers to inspect in IDA Pro. Use the function addresses to jump directly (`G` in IDA) to relevant disassembly and decompiled logic.")
+            L.append("")
+            headers = ["Address", "Function Name", "Original Name", "Classification", "Assessment & What to Inspect in IDB"]
+            rows = []
+            for f in model["key_functions"]:
+                addr = "`%s`" % _md(f.get("address", "")) if f.get("address") else "-"
+                fn_name = "`%s`" % _md(f.get("name", ""))
+                orig = "`%s`" % _md(f.get("original_name")) if f.get("original_name") and f.get("original_name") != "-" else "-"
+                verd = f.get("verdict") or "Suspicious"
+                guidance = f.get("triage_guidance") or f.get("summary") or "Inspect subroutine logic in IDA."
+                rows.append([addr, fn_name, orig, verd, guidance])
+            L.extend(_table(headers, rows))
+        for fn in model["key_functions"]:
+            extras = []
+            if fn.get("behaviors"):
+                extras.append("- **Observed Behaviors**: " + "; ".join(_md(b) for b in fn["behaviors"]))
+            if fn.get("apis"):
+                extras.append("- **APIs Referenced**: " + ", ".join("`%s`" % a for a in fn["apis"]))
+            if extras:
+                L.extend(["#### %s (%s)" % (_md(fn.get("name")), _md(fn.get("address", ""))), ""] + extras + [""])
 
     notes = model.get("analysis_gaps") or model.get("analyst_notes") or model.get("imports") or model.get("strings") \
         or model.get("renamed_functions") or model.get("findings") or model.get("agent_report")
@@ -273,9 +305,11 @@ def _inline_html(text: str) -> str:
 
 
 def _cell_html(text: str) -> str:
-    if text.strip().lower() in VERDICTS:
-        v = text.strip().lower()
-        return '<span class="verdict %s">%s</span>' % (v, v.upper())
+    cleaned = text.strip()
+    key = cleaned.lower()
+    if key in VERDICTS or "core" in key:
+        cls = "core-functionality" if "core" in key else key
+        return '<span class="verdict %s">%s</span>' % (cls, cleaned.upper())
     return _inline_html(text)
 
 
@@ -300,7 +334,7 @@ pre{background:var(--code);border:1px solid var(--line);border-radius:8px;paddin
 .tw{overflow-x:auto;margin:12px 0}table{border-collapse:collapse;width:100%;font-size:13.5px}
 th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}th{background:#1c2230;color:#cbd5e1}tr:nth-child(even) td{background:#141821}
 .verdict{border-radius:4px;padding:1px 7px;font-size:11px;font-weight:700}.benign{background:#14532d;color:#86efac}.interesting{background:#1e3a8a;color:#93c5fd}
-.suspicious{background:#78350f;color:#fed7aa}.malicious{background:#7f1d1d;color:#fecaca}
+.suspicious{background:#78350f;color:#fed7aa}.malicious{background:#7f1d1d;color:#fecaca}.core-functionality{background:#1e293b;color:#38bdf8;border:1px solid #0284c7}
 pre.mermaid{background:var(--panel);text-align:center}
 @media print{body{background:#fff;color:#111}nav{display:none}.card,pre,th,td{border-color:#ccc}code,pre{background:#f4f4f4;color:#111}}
 @media(max-width:900px){nav{display:none}main{padding:20px}}
@@ -311,6 +345,8 @@ def render_html(markdown: str, model: Dict[str, Any]) -> str:
     sample = model.get("sample", {})
     blocks = parse_blocks(markdown)
     nav = [b[2] for b in blocks if b[0] == "h" and b[1] == 2]
+    if not nav:
+        nav = [b[2] for b in blocks if b[0] == "h" and b[1] in (1, 2, 3)]
     nav_html = "\n".join('<li><a href="#%s">%s</a></li>' % (slugify(t), html.escape(t)) for t in nav)
     stats = model.get("stats", {})
     cards = [
@@ -359,7 +395,9 @@ def render_html(markdown: str, model: Dict[str, Any]) -> str:
         body.append("</section>")
     mermaid = ('<script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";'
                'mermaid.initialize({startOnLoad:true,theme:"dark"});</script>') if has_mermaid else ""
-    title = html.escape(str(sample.get("filename", "sample")))
+    h1_candidates = [b[2] for b in blocks if b[0] == "h" and b[1] == 1]
+    title_text = str(model.get("title") or sample.get("filename") or (h1_candidates[0] if h1_candidates else "Analysis Report"))
+    title = html.escape(title_text)
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>%s - Analysis Report</title><style>%s</style></head>
@@ -391,6 +429,13 @@ def render_pdf(markdown: str, model: Dict[str, Any], output: Path) -> str:
 
 
 def _rl_inline(text: str) -> str:
+    cleaned = text.strip().lower()
+    if cleaned == "malicious":
+        return '<font color="#DC2626"><b>MALICIOUS</b></font>'
+    if cleaned == "suspicious":
+        return '<font color="#D97706"><b>SUSPICIOUS</b></font>'
+    if cleaned in ("core functionality", "core"):
+        return '<font color="#0284C7"><b>CORE FUNCTIONALITY</b></font>'
     out = html.escape(_pdf_text(text), quote=False)
     out = re.sub(r"`([^`]+)`", r'<font face="Courier" color="#2B6CB0">\1</font>', out)
     out = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", out)
@@ -417,16 +462,18 @@ def _render_pdf_reportlab(blocks: List[Block], model: Dict[str, Any], output: Pa
     }
     sample = model.get("sample", {})
     width = letter[0] - 80
+    h1_candidates = [b[2] for b in blocks if b[0] == "h" and b[1] == 1]
+    title_text = str(model.get("title") or sample.get("filename") or (h1_candidates[0] if h1_candidates else "sample"))
 
     def footer(canvas, doc):
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
         canvas.setFillColor(colors.HexColor("#718096"))
-        canvas.drawString(40, 22, "OmniIDB analysis report - %s" % _pdf_text(str(sample.get("filename", ""))))
+        canvas.drawString(40, 22, "OmniIDB analysis report - %s" % _pdf_text(str(sample.get("filename") or title_text)))
         canvas.drawRightString(letter[0] - 40, 22, "Page %d" % doc.page)
         canvas.restoreState()
 
-    story: List[Any] = [Paragraph("<b>OMNIIDB ANALYSIS REPORT</b>", body), Paragraph(html.escape(_pdf_text(str(sample.get("filename", "sample")))), title),
+    story: List[Any] = [Paragraph("<b>OMNIIDB ANALYSIS REPORT</b>", body), Paragraph(html.escape(_pdf_text(title_text)), title),
                         Paragraph("<b>Classification:</b> %s" % html.escape(_pdf_text(str(model.get("category") or "Unclassified"))), body),
                         Paragraph("<b>SHA256:</b> <font face='Courier'>%s</font>" % html.escape(str(sample.get("sha256", "n/a"))), body),
                         Spacer(1, 10)]
@@ -531,10 +578,12 @@ def _plain(text: str) -> str:
 
 def _render_pdf_builtin(blocks: List[Block], model: Dict[str, Any], output: Path) -> None:
     sample = model.get("sample", {})
-    doc = _PdfDoc("OmniIDB analysis report - %s" % sample.get("filename", ""))
+    h1_candidates = [b[2] for b in blocks if b[0] == "h" and b[1] == 1]
+    title_text = str(model.get("title") or sample.get("filename") or (h1_candidates[0] if h1_candidates else "sample"))
+    doc = _PdfDoc("OmniIDB analysis report - %s" % (sample.get("filename") or title_text))
     navy, slate, blue = (0.1, 0.21, 0.36), (0.17, 0.2, 0.28), (0.17, 0.42, 0.69)
     doc.line("OMNIIDB ANALYSIS REPORT", "F2", 9, (0.4, 0.45, 0.5))
-    doc.wrapped(str(sample.get("filename", "sample")), "F2", 20, (0.05, 0.07, 0.11), gap=4, factor=0.55)
+    doc.wrapped(title_text, "F2", 20, (0.05, 0.07, 0.11), gap=4, factor=0.55)
     doc.wrapped("Classification: %s" % (model.get("category") or "Unclassified"), "F1", 10, slate, gap=4)
     doc.wrapped("SHA256: %s" % sample.get("sha256", "n/a"), "F3", 8, slate, gap=2, factor=0.6)
     for b in blocks:
@@ -588,6 +637,43 @@ def render_reports(
         logger("PDF rendered with %s engine" % engine)
     except Exception as error:  # noqa: BLE001 - PDF is best effort, md/html are already written
         logger("PDF rendering failed: %s" % error)
+    return paths
+
+
+def render_markdown_deliverables(
+    markdown: str,
+    out_dir: Path | str,
+    model: Optional[Dict[str, Any]] = None,
+    base_name: str = "report",
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Dict[str, str]:
+    """Render raw markdown text into {base_name}.md, {base_name}.html, and {base_name}.pdf in out_dir."""
+    logger = log_fn or (lambda _m: None)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    paths: Dict[str, str] = {}
+    md_file = out / f"{base_name}.md"
+    html_file = out / f"{base_name}.html"
+    pdf_file = out / f"{base_name}.pdf"
+
+    md_file.write_text(markdown, encoding="utf-8")
+    paths["markdown"] = str(md_file)
+
+    model_dict = dict(model or {})
+    try:
+        html_content = render_html(markdown, model_dict)
+        html_file.write_text(html_content, encoding="utf-8")
+        paths["html"] = str(html_file)
+    except Exception as error:
+        logger(f"HTML rendering failed ({html_file.name}): {error}")
+
+    try:
+        engine = render_pdf(markdown, model_dict, pdf_file)
+        paths["pdf"] = str(pdf_file)
+        logger(f"PDF rendered with {engine} engine ({pdf_file.name})")
+    except Exception as error:
+        logger(f"PDF rendering failed ({pdf_file.name}): {error}")
+
     return paths
 
 

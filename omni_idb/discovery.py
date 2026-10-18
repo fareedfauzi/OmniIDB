@@ -12,12 +12,13 @@ from pathlib import Path
 from typing import Optional
 
 MAX_PROBE = 1024 * 1024
-MAX_SHELLCODE_SIZE = 256 * 1024 * 1024
 
 
 def compute_file_md5(path: Path) -> str:
     """Fast MD5 checksum computation for a sample."""
     try:
+        if path.stat().st_size > 200 * 1024 * 1024:
+            return "--"
         h = hashlib.md5()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(262144), b""):
@@ -31,7 +32,6 @@ class SampleKind(enum.Enum):
     EXECUTABLE = ("Executable", "executable")
     DOTNET_ASSEMBLY = (".NET assembly", "dotnet_assembly")
     IDA_DATABASE = ("IDA database", "ida_database")
-    SHELLCODE = ("Raw shellcode", "shellcode")
 
     @property
     def label(self) -> str:
@@ -223,18 +223,7 @@ def _looks_like_text(data: bytes) -> bool:
     return printable * 100 >= len(sample) * 90
 
 
-def _validate_shellcode(data: bytes, size: int) -> None:
-    if size < 2:
-        raise ClassifyError("shellcode is too small")
-    if size > MAX_SHELLCODE_SIZE:
-        raise ClassifyError("raw shellcode exceeds the 256 MiB safety limit")
-    if data.count(data[0]) == len(data):
-        raise ClassifyError("raw file contains only one repeated byte")
-    if _looks_like_text(data):
-        raise ClassifyError("text content is not shellcode")
-
-
-def classify_sample(path: Path | str, allow_shellcode: bool) -> SampleKind:
+def classify_sample(path: Path | str) -> SampleKind:
     """Return the sample kind, or raise ``ClassifyError`` with the rejection reason."""
     path = Path(path)
     try:
@@ -277,16 +266,13 @@ def classify_sample(path: Path | str, allow_shellcode: bool) -> SampleKind:
     if ext in ("macho", "dylib"):
         raise ClassifyError("malformed Mach-O file")
     if ext in ("bin", "raw", "sc", "shellcode"):
-        if not allow_shellcode:
-            raise ClassifyError("raw shellcode support is disabled")
-        _validate_shellcode(data, size)
-        return SampleKind.SHELLCODE
+        raise ClassifyError("Raw shellcode binary must first be loaded and converted to code/functions in an IDA database (.idb/.i64)")
     raise ClassifyError("unrecognized or unsupported file format")
 
 
-def _push_classified(path: Path, allow_shellcode: bool, report: DiscoveryReport) -> None:
+def _push_classified(path: Path, report: DiscoveryReport) -> None:
     try:
-        kind = classify_sample(path, allow_shellcode)
+        kind = classify_sample(path)
     except ClassifyError as error:
         report.rejected.append(RejectedFile(path, str(error)))
         return
@@ -312,12 +298,11 @@ def discover(
     input_path: Path | str,
     recursive: bool = True,
     output_root: Path | str | None = None,
-    allow_shellcode: bool = False,
 ) -> DiscoveryReport:
     input_path = Path(input_path)
     report = DiscoveryReport()
     if input_path.is_file():
-        _push_classified(input_path, allow_shellcode, report)
+        _push_classified(input_path, report)
         return report
     if not input_path.is_dir():
         raise OSError(f"Input path is not a file or directory: {input_path}")
@@ -325,7 +310,7 @@ def discover(
     output = None
     if output_root and str(output_root).strip():
         try:
-            output = Path(output_root).resolve(strict=True)
+            output = Path(output_root).resolve()
         except OSError:
             output = None
 
@@ -357,7 +342,7 @@ def discover(
             if canonical in seen:
                 continue
             seen.add(canonical)
-            _push_classified(path, allow_shellcode, report)
+            _push_classified(path, report)
 
     report.samples.sort(key=lambda s: s.path)
     report.rejected.sort(key=lambda r: r.path)

@@ -219,6 +219,53 @@ def _pipe_lines(stream, out: "queue.Queue[str]") -> None:
     threading.Thread(target=pump, daemon=True).start()
 
 
+def _is_64bit_sample(path: Path) -> bool:
+    """Fast header probe to determine if sample is 64-bit (PE, ELF, Mach-O)."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(1024)
+        if len(header) < 16:
+            return True
+        # PE check
+        if header[:2] == b"MZ" and len(header) >= 0x40:
+            pe_offset = int.from_bytes(header[0x3C:0x40], "little")
+            if len(header) >= pe_offset + 6 and header[pe_offset:pe_offset+4] == b"PE\0\0":
+                machine = int.from_bytes(header[pe_offset+4:pe_offset+6], "little")
+                # 0x8664 = x64, 0xAA64 = ARM64, 0x0200 = IA64
+                return machine in (0x8664, 0xAA64, 0x0200)
+        # ELF check
+        if header[:4] == b"\x7fELF":
+            return header[4] == 2  # 1 = 32-bit, 2 = 64-bit
+        # Mach-O check
+        if header[:4] in (b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe"):
+            return True
+        if header[:4] in (b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe"):
+            return False
+    except OSError:
+        pass
+    return True
+
+
+def _resolve_ida_binary(configured_ida: Path, is_64: bool) -> Path:
+    """Auto-select between ida.exe and ida64.exe (or idat.exe and idat64.exe) in IDA <= 8.4."""
+    if not configured_ida.is_file():
+        return configured_ida
+    folder = configured_ida.parent
+    stem = configured_ida.stem.lower()
+    ext = configured_ida.suffix
+
+    if is_64 and stem in ("ida", "idat"):
+        cand = folder / f"{stem}64{ext}"
+        if cand.is_file():
+            return cand
+    elif not is_64 and stem in ("ida64", "idat64"):
+        base_stem = stem[:-2]
+        cand = folder / f"{base_stem}{ext}"
+        if cand.is_file():
+            return cand
+    return configured_ida
+
+
 def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: threading.Event, remaining_budget: Optional[int] = None) -> tuple[str, dict]:
     settings = request.settings
     digest = sha256_file(sample.path)
@@ -229,8 +276,10 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
     report_dir = output_root / "report"
     logs = output_root / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    idb_path = idb_dir / "analyzed.i64"
-    original_idb_path = idb_dir / "original.i64"
+    is_64 = sample.path.suffix.lower() == ".i64" if sample.kind == SampleKind.IDA_DATABASE else _is_64bit_sample(sample.path)
+    db_ext = ".i64" if is_64 else ".idb"
+    idb_path = idb_dir / f"analyzed{db_ext}"
+    original_idb_path = idb_dir / f"original{db_ext}"
     result_path = output_root / "result.json"
     failure_path = logs / "failure.txt"
     ida_log = logs / "ida.log"
@@ -302,6 +351,13 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
                     token_budget=remaining_budget or 0,
                     log_fn=lambda message: _post(q, "log", message=message),
                     cancel_checker=cancelled.is_set,
+                    sample_info={
+                        "filename": sample.path.name,
+                        "sha256": digest,
+                        "file_type": ".NET Assembly",
+                        "architecture": "MSIL / AnyCPU",
+                    },
+                    report_dir=report_dir,
                 )
                 res["workspace_analysis_report"] = analysis["report_path"]
                 res["provider"] = {
@@ -319,12 +375,15 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
             ]
             if res["cs_count"] > 0:
                 parts.append(f"{res['cs_count']} C# files")
+            reports = [p.name for p in [report_dir / "report.md", report_dir / "report.html", report_dir / "report.pdf", report_dir / "workspace_analysis.html"] if p.is_file()]
+            if reports:
+                parts.append(f"reports: {', '.join(dict.fromkeys(reports))}")
             if res.get("workspace_analysis_report"):
                 parts.append("workspace analysis: done")
             return f"Completed .NET AI Workspace ({', '.join(parts)})", res
 
     idb_dir.mkdir(parents=True, exist_ok=True)
-    ida = Path(settings.ida_path.strip())
+    ida = _resolve_ida_binary(Path(settings.ida_path.strip().strip("\"'")), is_64)
     if not ida.is_file():
         raise FileNotFoundError(f"IDA executable not found: {ida}")
     genesect_root = Path(settings.genesect_root.strip())
@@ -335,7 +394,7 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
     # Output folders are deterministic. IDA prompts instead of overwriting an
     # existing database and a stale failure file can mask a new failure, so
     # remove only the generated per-run files first.
-    remove_previous_run_files([idb_path, original_idb_path, result_path, failure_path, ida_log])
+    remove_previous_run_files([idb_path, original_idb_path, idb_dir / "analyzed.i64", idb_dir / "analyzed.idb", idb_dir / "original.i64", idb_dir / "original.idb", result_path, failure_path, ida_log])
 
     job = {
         "omni_root": str(project_root().resolve()),
@@ -348,14 +407,16 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
         "result_path": str(result_path),
         "failure_path": str(failure_path),
         "sample_kind": sample.kind.job_value,
-        "shellcode_arch": settings.shellcode_arch,
         "rename_functions": settings.rename_functions,
+        "rename_functions_with_address": getattr(settings, "rename_functions_with_address", False),
         "rename_variables": settings.rename_variables,
         "generate_workspace": settings.generate_workspace,
         "analyze_workspace": settings.analyze_workspace,
         "autonomous_investigation": settings.autonomous_investigation,
         "investigation_turns": settings.investigation_turns,
         "batch_size": settings.batch_size,
+        "workers": getattr(settings, "workers", 3),
+        "low_score_rescan": getattr(settings, "low_score_rescan", False),
         "cooldown_seconds": settings.cooldown_seconds,
         "asm_max_lines": 25,
         "use_rename_cache": getattr(settings, "use_rename_cache", True),
@@ -387,10 +448,6 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
             json.dump(job, handle, indent=2)
 
         args = ["-A", f"-L{ida_log}", f"-o{idb_path}"]
-        if sample.kind == SampleKind.SHELLCODE:
-            # Skip the loader dialog and use IDA's raw binary loader; the batch
-            # script sets the exact segment/application bitness.
-            args += ["-TBinary", "-pmetapc"]
 
         env = os.environ.copy()
         for name in ("VIRTUAL_ENV", "__PYVENV_LAUNCHER__", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE", "PYTHONINSPECT"):
@@ -462,6 +519,63 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
         except Exception as exc:
             _post(q, "log", message=f"Warning: Failed to render reports: {exc}")
 
+    # If workspace analysis report was produced, ensure HTML and PDF deliverables are rendered.
+    ws_report_md = None
+    for cand in [report_dir / "workspace_analysis.md", workspace / "malware_analysis_report.md"]:
+        if cand.is_file():
+            ws_report_md = cand
+            break
+    if ws_report_md:
+        try:
+            report_text = ws_report_md.read_text(encoding="utf-8", errors="replace")
+            is_dotnet_target = sample.kind.name == "DOTNET" or (workspace / "catalog" / "types.json").is_file() or (workspace / "src").is_dir()
+            try:
+                from .workspace_analysis import ensure_report_navigation
+                report_text = ensure_report_navigation(report_text, workspace, is_dotnet=is_dotnet_target)
+                ws_report_md.write_text(report_text, encoding="utf-8")
+                for cand in [report_dir / "workspace_analysis.md", workspace / "malware_analysis_report.md"]:
+                    if cand.is_file() and cand != ws_report_md:
+                        cand.write_text(report_text, encoding="utf-8")
+            except Exception:
+                pass
+            sample_model = {
+                "sample": {
+                    "filename": sample.path.name,
+                    "sha256": digest,
+                    "file_type": sample.kind.ui_label,
+                    "architecture": "x64" if is_64 else "x86",
+                },
+                "category": "Malware Analysis Report",
+                "provider": {"used": [settings.provider]},
+                "badges": ["Exported AI Workspace", settings.provider],
+            }
+            if workspace.is_dir() and not (workspace / "malware_analysis_report.html").is_file():
+                reporting.render_markdown_deliverables(
+                    report_text,
+                    workspace,
+                    model=sample_model,
+                    base_name="malware_analysis_report",
+                    log_fn=lambda m: _post(q, "log", message=m),
+                )
+            if not (report_dir / "workspace_analysis.html").is_file():
+                reporting.render_markdown_deliverables(
+                    report_text,
+                    report_dir,
+                    model=sample_model,
+                    base_name="workspace_analysis",
+                    log_fn=lambda m: _post(q, "log", message=m),
+                )
+            if not (report_dir / "report.html").is_file():
+                reporting.render_markdown_deliverables(
+                    report_text,
+                    report_dir,
+                    model=sample_model,
+                    base_name="report",
+                    log_fn=lambda m: _post(q, "log", message=m),
+                )
+        except Exception as exc:
+            _post(q, "log", message=f"Warning: Failed to render workspace analysis HTML/PDF: {exc}")
+
     result = json.loads(result_path.read_text(encoding="utf-8"))
     renamed = _dig(result, "function_rename", "renamed") or 0
     fn_skipped = _dig(result, "function_rename", "skipped")
@@ -520,7 +634,6 @@ STAGE_NAMES = {
     "workspace_analysis": "Analyzing AI Workspace",
     "report": "Generating Reports",
     "save": "Saving IDB Files",
-    "shellcode": "Loading Shellcode",
 }
 
 

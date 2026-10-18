@@ -144,7 +144,7 @@ If your primary API provider hits rate limits or token limits, check **Enable Fa
 ## Input Formats
 
 - **Supported binaries**: Windows PE (`.exe`, `.dll`, `.sys`, `.exe_`), Linux ELF, macOS Mach-O, and existing IDA databases (`.idb`, `.i64`).
-- **Raw shellcode**: Check **Accept raw shellcode** and pick the architecture (`x64`, `x86`, `arm`, `arm64`). OmniIDB loads it at offset `0x0`.
+- **Shellcode**: For raw shellcode blobs, convert the bytes to code/functions in IDA Pro first, save the database (`.idb` / `.i64`), and feed the database directly into OmniIDB.
 - **Auto-filtering**: Non-binary files (scripts, code, text, images) are skipped automatically during directory scans so your queue stays clean.
 - **Managed .NET assemblies**: The .NET mode exports a compilable ILSpy C# project, full CIL, metadata, strings, resources, and optional workspace analysis without launching IDA. ILSpyCmd is provisioned from the official NuGet package on first use when it is not already installed.
 
