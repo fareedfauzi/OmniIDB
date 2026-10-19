@@ -22,13 +22,60 @@ from pathlib import Path
 
 
 EVENT_PREFIX = "OMNI_EVENT "
+_EVENT_COUNTER = 0
+_EVENTS_HANDLE = None
 
 
-def emit(kind, message, **fields):
-    payload = {"kind": str(kind), "message": str(message)}
+def _emit_direct_event(line: str) -> None:
+    global _EVENTS_HANDLE
+    events_path = CURRENT_JOB.get("events_path") or os.environ.get("OMNI_IDB_EVENTS_FILE")
+    if not events_path:
+        return
+    try:
+        if _EVENTS_HANDLE is None or _EVENTS_HANDLE.closed:
+            _EVENTS_HANDLE = open(events_path, "a", encoding="utf-8")
+        _EVENTS_HANDLE.write(line + "\n")
+        _EVENTS_HANDLE.flush()
+        try:
+            os.fsync(_EVENTS_HANDLE.fileno())
+        except Exception:
+            pass
+    except Exception:
+        try:
+            with open(events_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+        except Exception:
+            pass
+
+
+def emit(kind, message=None, **fields):
+    global _EVENT_COUNTER
+    _EVENT_COUNTER += 1
+    if message is None:
+        message = fields.pop("message", "")
+    payload = {"_seq": _EVENT_COUNTER, "kind": str(kind), "message": str(message)}
     payload.update(fields)
     line = EVENT_PREFIX + json.dumps(payload, ensure_ascii=False, sort_keys=True)
     print(line, flush=True)
+    _emit_direct_event(line)
+
+
+class DirectSignal:
+    """Thread-safe direct callback emitter replacing Qt queued signals in headless worker threads."""
+
+    def __init__(self, target_fn):
+        self._target_fn = target_fn
+
+    def emit(self, *args, **kwargs):
+        try:
+            self._target_fn(*args, **kwargs)
+        except Exception:
+            pass
+
+    def connect(self, fn):
+        pass
+
 
 
 def load_args():
@@ -93,6 +140,16 @@ PROVIDER_MAPPING = {
     "CopilotCLI": ("copilot_cli_path", None, "copilot_cli_model"),
 }
 CLI_PROVIDERS = ("ClaudeCode", "AntigravityCLI", "OpenCode", "CopilotCLI")
+SERIAL_PROVIDERS = frozenset((
+    "ChatGPTAccount",
+    "ClaudeCode",
+    "AntigravityCLI",
+    "OpenCode",
+    "CopilotCLI",
+    "OpenAICompatible",
+    "Ollama",
+    "LMStudio",
+))
 WORKER_PROVIDER = {
     "OpenAI": "openai",
     "Anthropic": "anthropic",
@@ -105,10 +162,21 @@ WORKER_PROVIDER = {
     "LMStudio": "lmstudio",
 }
 
-# Filled while the job runs; written to result.json and the report appendix.
 PROVIDER_INFO = {"primary": "", "used": [], "fallback_events": [], "active": ""}
 RENAMED = []
+RENAMED_VARS = []
 INVESTIGATION = {}
+CURRENT_JOB = {}
+
+
+def should_stop():
+    stop_file = CURRENT_JOB.get("stop_file")
+    if stop_file:
+        try:
+            return Path(stop_file).is_file()
+        except Exception:
+            pass
+    return False
 
 
 def apply_profile(profile, config):
@@ -148,11 +216,20 @@ def provider_chain(job):
     """Ordered provider profiles: the active one first, then the optional fallback."""
     primary = dict(job.get("profile") or {})
     fallback = dict(job.get("fallback_profile") or {})
-    if job.get("fallback_enabled") and fallback.get("provider") and fallback.get("provider") != primary.get("provider"):
-        if job.get("use_fallback_first"):
-            return [fallback, primary]
+    if job.get("fallback_enabled") and fallback.get("provider") and fallback != primary:
         return [primary, fallback]
     return [primary]
+
+
+def provider_requires_serial_requests(provider):
+    """Return whether a provider must receive one request at a time.
+
+    Account/CLI providers share a login session or child process, while the
+    generic compatible and local providers are commonly backed by a single
+    model worker. Concurrent batch requests can deadlock or exhaust that
+    worker, so cloud API providers are the only profiles parallelized here.
+    """
+    return str(provider or "") in SERIAL_PROVIDERS
 
 
 def configure_provider(job, config):
@@ -161,9 +238,12 @@ def configure_provider(job, config):
     PROVIDER_INFO["primary"] = str((job.get("profile") or {}).get("provider") or "OpenAI")
     PROVIDER_INFO["active"] = worker["profile_name"]
     PROVIDER_INFO["used"] = [worker["profile_name"]]
+    requested_workers = max(1, min(8, int(job.get("workers") or job.get("parallel_workers", 3))))
+    effective_workers = 1 if provider_requires_serial_requests(worker["profile_name"]) else requested_workers
     worker.update({
         "batch_size": max(1, int(job.get("batch_size", 15))),
-        "parallel_workers": max(1, min(8, int(job.get("workers") or job.get("parallel_workers", 3)))),
+        "parallel_workers": effective_workers,
+        "requested_parallel_workers": requested_workers,
         "low_score_rescan": bool(job.get("low_score_rescan", False)),
         "cooldown_seconds": max(0, int(job.get("cooldown_seconds", 0))),
         "asm_max_lines": max(1, int(job.get("asm_max_lines", 25))),
@@ -172,6 +252,13 @@ def configure_provider(job, config):
         "use_custom_prompt": False,
         "custom_prompt": "",
     })
+    if effective_workers != requested_workers:
+        emit(
+            "log",
+            "%s uses serial AI requests; worker count reduced from %d to 1 to prevent provider stalls."
+            % (worker["profile_name"], requested_workers),
+            level="info",
+        )
     return worker
 
 
@@ -193,6 +280,235 @@ def query_copilot_cli(executable, model, prompt, sys_prompt, timeout=120):
     return proc.stdout.strip() or proc.stderr.strip()
 
 
+_HTTP_SESSION = None
+
+def get_http_session():
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        try:
+            import requests
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(pool_connections=25, pool_maxsize=25, max_retries=2, pool_block=False)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            _HTTP_SESSION = session
+        except Exception:
+            _HTTP_SESSION = False
+    return _HTTP_SESSION
+
+
+def query_openai_compatible(url, key, model, prompt, sys_prompt, max_tokens=None, timeout=120, cancel_checker=None):
+    import json
+    import re
+    import urllib.request
+    import urllib.error
+    import ssl
+
+    if cancel_checker and cancel_checker():
+        return ""
+
+    supplied_url = str(url or "").strip()
+    if not supplied_url:
+        raise ValueError("Missing API URL for OpenAI-compatible provider")
+    if supplied_url.rstrip("/").lower().endswith("/generate"):
+        req_url = supplied_url.rstrip("/")
+    else:
+        from omni_idb.config import openai_chat_endpoint
+        req_url = openai_chat_endpoint(supplied_url)
+
+    hdrs = {
+        "Content-Type": "application/json",
+        "User-Agent": "OmniIDB-Runner/1.0",
+    }
+    if key:
+        hdrs["Authorization"] = "Bearer " + str(key).strip()
+    if "generativelanguage.googleapis.com" in req_url.lower():
+        hdrs["x-goog-api-client"] = "omni-idb-oai/1.0"
+
+    model_name = str(model or "").strip()
+    model_l = model_name.lower()
+    is_reasoning = any(k in model_l for k in ("qwen", "deepseek", "r1", "think", "reason", "coder", "o1", "o3", "gpt-5"))
+    is_openai_reasoning = any(k in model_l for k in ("o1", "o3", "gpt-5"))
+
+    # Allocate sufficient tokens for reasoning models, respecting explicit max_tokens when provided
+    eff_tokens = max(int(max_tokens or 0), 3000) if is_reasoning else max(int(max_tokens or 0), 1024)
+
+    messages = []
+    if sys_prompt:
+        messages.append({"role": "system", "content": str(sys_prompt)})
+    messages.append({"role": "user", "content": str(prompt)})
+
+    payload = {
+        "model": model_name,
+        "messages": messages,
+    }
+    if is_openai_reasoning:
+        payload["max_completion_tokens"] = eff_tokens
+    else:
+        payload["max_tokens"] = eff_tokens
+        payload["temperature"] = 0.1
+
+    # For vLLM / HuggingFace reasoning models (like Qwen, DeepSeek), disable thinking to get fast, direct responses
+    if is_reasoning and not is_openai_reasoning:
+        payload["chat_template_kwargs"] = {"thinking": False}
+
+    session = get_http_session()
+    if session and "example.com" not in req_url:
+        try:
+            r = session.post(req_url, headers=hdrs, json=payload, timeout=timeout)
+            if r.status_code == 400 and "chat_template_kwargs" in payload:
+                payload.pop("chat_template_kwargs", None)
+                r = session.post(req_url, headers=hdrs, json=payload, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            choices = data.get("choices") or [{}]
+            message = choices[0].get("message") or {}
+            content = message.get("content") or message.get("reasoning_content") or message.get("reasoning") or ""
+            return re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+        except Exception as exc:
+            # Do not silently repeat a timed-out request with urllib. That made
+            # one provider timeout take twice as long and could duplicate a
+            # successful request whose response was interrupted.
+            raise RuntimeError("OpenAICompatible API error: %s" % exc) from exc
+
+    def _execute(body_dict):
+        raw_body = json.dumps(body_dict).encode("utf-8")
+        req = urllib.request.Request(req_url, data=raw_body, headers=hdrs, method="POST")
+        try:
+            ctx = ssl.create_default_context()
+        except Exception:
+            ctx = None
+        try:
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        except urllib.error.URLError as err:
+            if "certificate" in str(err).lower() or "ssl" in str(err).lower():
+                unverified_ctx = ssl._create_unverified_context()
+                return urllib.request.urlopen(req, timeout=timeout, context=unverified_ctx)
+            raise
+
+    try:
+        try:
+            resp = _execute(payload)
+        except urllib.error.HTTPError as http_err:
+            # If server rejects chat_template_kwargs with HTTP 400, retry immediately without it
+            if http_err.code == 400 and "chat_template_kwargs" in payload:
+                payload.pop("chat_template_kwargs", None)
+                resp = _execute(payload)
+            else:
+                err_body = ""
+                try:
+                    err_body = http_err.read().decode("utf-8", errors="replace")[:300]
+                except Exception:
+                    pass
+                raise RuntimeError("API request failed with HTTP %d: %s" % (http_err.code, err_body or http_err.reason))
+        with resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as exc:
+        raise RuntimeError("OpenAICompatible API error: %s" % exc) from exc
+
+    choices = data.get("choices") or [{}]
+    msg = choices[0].get("message") or {}
+    content = msg.get("content") or ""
+    if not content.strip():
+        content = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+    return content
+
+
+def query_anthropic(url, key, model, prompt, sys_prompt, max_tokens=None, timeout=120):
+    import json
+    import urllib.error
+    import urllib.request
+    from omni_idb.config import normalize_anthropic_base_url
+
+    if not key:
+        raise ValueError("Missing API key for Anthropic")
+    base_url = normalize_anthropic_base_url(url or "https://api.anthropic.com")
+    endpoint = base_url + "/v1/messages"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": str(key).strip(),
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "OmniIDB-Runner/1.0",
+    }
+    payload = {
+        "model": str(model or "claude-sonnet-4-6"),
+        "max_tokens": max(int(max_tokens or 1024), 2000),
+        "messages": [{"role": "user", "content": str(prompt)}],
+    }
+    if sys_prompt:
+        payload["system"] = str(sys_prompt)
+    request = urllib.request.Request(
+        endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            detail = str(exc.reason)
+        raise RuntimeError("Anthropic API failed with HTTP %d: %s" % (exc.code, detail)) from exc
+    except Exception as exc:
+        raise RuntimeError("Anthropic API error: %s" % exc) from exc
+    result = "".join(
+        str(item.get("text") or "") for item in (data.get("content") or [])
+        if isinstance(item, dict) and item.get("type") in (None, "text")
+    ).strip()
+    if not result:
+        raise RuntimeError("Anthropic API returned no text content")
+    return result
+
+
+def query_chatgpt_account_responses(chatgpt_oauth, model, prompt, sys_prompt,
+                                    max_tokens=None, on_chunk=None):
+    """Use the ChatGPT account OAuth token with the supported Responses API."""
+    import openai
+
+    def _request(access_token):
+        client = openai.OpenAI(api_key=access_token, base_url="https://api.openai.com/v1")
+        stream = client.responses.create(
+            model=model,
+            input=[{"role": "user", "content": prompt}],
+            instructions=sys_prompt,
+            max_output_tokens=max(int(max_tokens or 1024), 2000),
+            store=False,
+            stream=True,
+        )
+        output = []
+        completed = False
+        with stream:
+            for event in stream:
+                event_type = getattr(event, "type", "")
+                if event_type == "response.output_text.delta":
+                    delta = str(getattr(event, "delta", "") or "")
+                    if delta:
+                        output.append(delta)
+                        if on_chunk:
+                            on_chunk(delta)
+                elif event_type == "response.completed":
+                    completed = True
+                elif event_type == "response.failed":
+                    error = getattr(getattr(event, "response", None), "error", None)
+                    detail = getattr(error, "message", None) or getattr(error, "code", None) or "unknown error"
+                    raise RuntimeError("ChatGPT account response failed: %s" % detail)
+        if not completed:
+            raise RuntimeError("ChatGPT account stream ended without response.completed")
+        return "".join(output).strip()
+
+    try:
+        return _request(chatgpt_oauth.get_access_token())
+    except Exception as exc:
+        if getattr(exc, "status_code", None) != 401 or not hasattr(chatgpt_oauth, "refresh_credentials"):
+            raise
+        refreshed = chatgpt_oauth.refresh_credentials(force=True)
+        token = refreshed.get("access_token") if isinstance(refreshed, dict) else ""
+        if not token:
+            raise
+        return _request(token)
+
+
 def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root, job=None):
     original_request = renamer.ai_request
     chain = provider_chain(job or {})
@@ -208,6 +524,15 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
                 setattr(renamer, name, value)
         emit("log", "Provider fallback armed: %s -> %s" % (
             chain[0].get("provider"), " -> ".join(str(c.get("provider")) for c in chain[1:])))
+
+    try:
+        from omni_idb.sanitizer import safe_parse_batch_response
+        if hasattr(renamer, "AnalyzeWorker"):
+            renamer.AnalyzeWorker.parse_batch_response = lambda self, resp, expected: safe_parse_batch_response(
+                resp, expected, log_fn=lambda msg, lvl="info": self.log.emit(msg, lvl)
+            )
+    except Exception as exc:
+        emit("log", "Could not patch batch parser with sanitizer: %s" % exc, level="warning")
 
     def switch_provider(reason):
         if state["index"] + 1 >= len(chain):
@@ -230,6 +555,14 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
         return True
 
     def dispatch(cfg, prompt, sys_prompt, logger, on_chunk, max_tokens, cancel_checker):
+        def_preamble = (
+            "You are a professional defensive cybersecurity analyst reverse-engineering software for security auditing, "
+            "incident response, and compatibility verification. Your task is strictly to analyze decompiled code functions "
+            "and provide descriptive, professional identifier names in snake_case to assist security defenders.\n\n"
+        )
+        if sys_prompt and not sys_prompt.startswith("You are a professional defensive cybersecurity analyst"):
+            sys_prompt = def_preamble + sys_prompt
+
         profile_name = worker_cfg.get("profile_name", "OpenAI")
         if logger:
             logger("Provider request: %s / %s" % (profile_name, worker_cfg.get("model") or "default"))
@@ -264,20 +597,19 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
                     resolved_account_model[0],
                     [{"role": "user", "content": prompt}],
                     instructions=sys_prompt,
-                    max_output_tokens=int(max_tokens or 1024),
+                    max_output_tokens=max(int(max_tokens or 1024), 2000),
                     timeout=180,
                     on_chunk=on_chunk,
                 )
             else:
-                import openai
-                token = chatgpt_oauth.get_access_token()
-                client = openai.OpenAI(api_key=token, base_url="https://api.openai.com/v1")
-                resp = client.chat.completions.create(
-                    model=resolved_account_model[0] if resolved_account_model[0] != "auto" else "gpt-4o",
-                    messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}],
-                    max_tokens=int(max_tokens or 1024),
+                result = query_chatgpt_account_responses(
+                    chatgpt_oauth,
+                    resolved_account_model[0],
+                    prompt,
+                    sys_prompt,
+                    max_tokens=max_tokens,
+                    on_chunk=on_chunk,
                 )
-                result = resp.choices[0].message.content or ""
         elif profile_name in CLI_PROVIDERS:
             if profile_name == "CopilotCLI":
                 exe = str(getattr(config, "copilot_cli_path", "") or worker_cfg.get("executable") or "")
@@ -286,29 +618,88 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
             else:
                 from genesect.ai_client import SimpleAI
                 client = SimpleAI(config)
+                last_status = [-30.0]
+
+                def cli_status(elapsed):
+                    if elapsed - last_status[0] >= 30.0:
+                        last_status[0] = elapsed
+                        message = "%s is still processing (%.0fs elapsed)..." % (profile_name, elapsed)
+                        if logger:
+                            logger(message)
+                        else:
+                            emit("log", message, level="info")
+
                 result = client._query_signed_in_cli([
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": prompt},
-                ])
+                ], request_cancelled=cancel_checker, timeout=180, status_callback=cli_status)
+        elif profile_name == "Anthropic":
+            result = query_anthropic(
+                worker_cfg.get("api_url") or cfg.get("api_url") or "https://api.anthropic.com",
+                worker_cfg.get("api_key") or cfg.get("api_key") or "",
+                worker_cfg.get("model") or cfg.get("model") or "claude-sonnet-4-6",
+                prompt,
+                sys_prompt,
+                max_tokens=max_tokens,
+                timeout=180,
+            )
+        elif profile_name in ("OpenAI", "OpenAICompatible", "DeepSeek", "GoogleGemini", "OpenRouter", "Groq", "Mistral", "Ollama", "LMStudio"):
+            url = worker_cfg.get("api_url") or cfg.get("api_url") or ""
+            if not url:
+                if profile_name == "OpenAI":
+                    url = "https://api.openai.com/v1"
+                elif profile_name == "DeepSeek":
+                    url = "https://api.deepseek.com/v1"
+                elif profile_name == "GoogleGemini":
+                    url = "https://generativelanguage.googleapis.com/v1beta/openai"
+                elif profile_name == "OpenRouter":
+                    url = "https://openrouter.ai/api/v1"
+                elif profile_name == "Groq":
+                    url = "https://api.groq.com/openai/v1"
+                elif profile_name == "Mistral":
+                    url = "https://api.mistral.ai/v1"
+                elif profile_name == "Ollama":
+                    url = "http://localhost:11434/v1"
+                elif profile_name == "LMStudio":
+                    url = "http://localhost:1234/v1"
+            key = worker_cfg.get("api_key") or cfg.get("api_key") or ""
+            model = worker_cfg.get("model") or cfg.get("model") or ""
+            is_local = profile_name in ("Ollama", "LMStudio") or any(
+                h in url.lower() for h in ("localhost", "127.0.0.1", "100.", "192.168.", "10.", "172.", "169.254.")
+            )
+            local_timeout = 300 if is_local else 180
+            result = query_openai_compatible(
+                url, key, model, prompt, sys_prompt,
+                max_tokens=max_tokens, timeout=local_timeout, cancel_checker=cancel_checker
+            )
         else:
             result = original_request(
                 cfg, prompt, sys_prompt, logger=logger, on_chunk=None,
-                max_tokens=max_tokens, cancel_checker=cancel_checker,
+                max_tokens=max(int(max_tokens or 1024), 3000), cancel_checker=cancel_checker,
             )
         return str(result or "").strip(), profile_name
 
     tracker = (job or {}).get("_tracker")
     import threading
     request_lock = threading.Lock()
+    provider_call_lock = threading.Lock()
+
+    def record_terminal_error(profile_name, exc):
+        worker_cfg["_terminal_provider_error_count"] = int(
+            worker_cfg.get("_terminal_provider_error_count") or 0
+        ) + 1
+        worker_cfg["_last_terminal_provider_error"] = "%s: %s" % (profile_name, exc)
 
     def request(cfg, prompt, sys_prompt, logger=None, on_chunk=None,
                 on_cooldown=None, max_tokens=None, cancel_checker=None, **kwargs):
         del on_cooldown, kwargs
         while True:
-            if cancel_checker and cancel_checker():
+            if should_stop() or (cancel_checker and cancel_checker()):
                 return ""
-            profile_name = worker_cfg.get("profile_name", "OpenAI")
-            api_url = worker_cfg.get("api_url") or ""
+            with request_lock:
+                attempt_index = state["index"]
+                profile_name = worker_cfg.get("profile_name", "OpenAI")
+                api_url = worker_cfg.get("api_url") or ""
             if tracker:
                 with request_lock:
                     allowed = tracker.allowed(profile_name, api_url)
@@ -320,15 +711,49 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
                     from omni_idb.usage import BudgetExceeded
                     raise BudgetExceeded("Token budget reached (%d billable tokens)" % tracker.budget_tokens)
             try:
-                result, profile_name = dispatch(cfg, prompt, sys_prompt, logger, on_chunk, max_tokens, cancel_checker)
+                if provider_requires_serial_requests(profile_name):
+                    with provider_call_lock:
+                        # A concurrent request may have moved the shared chain
+                        # while this request waited for the serialized provider.
+                        with request_lock:
+                            provider_changed = state["index"] != attempt_index
+                        if provider_changed:
+                            continue
+                        result, profile_name = dispatch(
+                            cfg, prompt, sys_prompt, logger, on_chunk, max_tokens, cancel_checker
+                        )
+                else:
+                    result, profile_name = dispatch(
+                        cfg, prompt, sys_prompt, logger, on_chunk, max_tokens, cancel_checker
+                    )
+                cooldown_sec = max(0, int(worker_cfg.get("cooldown_seconds") or (job or {}).get("cooldown_seconds") or 0))
+                if cooldown_sec > 0 and not (cancel_checker and cancel_checker()):
+                    import time
+                    time.sleep(cooldown_sec)
             except Exception as exc:  # noqa: BLE001 - any provider failure may trigger the fallback
                 lowered = str(exc).lower()
                 permanent = any(t in lowered for t in ("context length", "context window", "maximum context", "prompt is too long", "too many tokens"))
                 with request_lock:
-                    switched = switch_provider("%s: %s" % (type(exc).__name__, exc))
+                    switched = not permanent and state["index"] != attempt_index
+                    if not permanent and not switched:
+                        switched = switch_provider("%s: %s" % (type(exc).__name__, exc))
                 if not permanent and switched:
                     continue
+                with request_lock:
+                    record_terminal_error(profile_name, exc)
                 raise
+            if result:
+                from omni_idb.sanitizer import is_ai_refusal
+                if is_ai_refusal(result):
+                    emit("log", "AI provider refusal/safety block detected (%s...)" % result[:60].replace("\n", " "), level="warning")
+                    with request_lock:
+                        switched = switch_provider("Refusal/Policy block: %s" % result[:80].replace("\n", " "))
+                    if switched:
+                        continue
+                    error = RuntimeError("AI provider returned a refusal or policy block")
+                    with request_lock:
+                        record_terminal_error(profile_name, error)
+                    raise error
             if not result and not (cancel_checker and cancel_checker()):
                 # Quota/auth failures often surface as empty replies on CLI providers.
                 # Retry this request on the fallback instead of returning a lost result.
@@ -336,6 +761,10 @@ def install_provider_adapter(config, worker_cfg, renamer, var_renamer, repo_root
                     switched = switch_provider("empty response")
                 if switched:
                     continue
+                error = RuntimeError("AI provider returned an empty response")
+                with request_lock:
+                    record_terminal_error(profile_name, error)
+                raise error
             if tracker and result:
                 try:
                     with request_lock:
@@ -412,12 +841,13 @@ def pre_process_go_symbols(sample_path, goresym_path=""):
 
     goresym_exe = gs.resolve_goresym(goresym_path)
     if not goresym_exe:
-        return 0
+        return 0, False
 
     emit("log", "GoReSym detected; recovering pclntab function names and types...", level="info")
     data = gs.run_goresym_restore(sample_path, goresym_exe)
     if not data:
-        return 0
+        # GoReSym was run, so binary might be Go with stripped/damaged pclntab
+        return 0, False
 
     renamed = 0
     funcs = data.get("UserFunctions") or []
@@ -432,7 +862,7 @@ def pre_process_go_symbols(sample_path, goresym_path=""):
                 renamed += 1
     if renamed > 0:
         emit("log", "GoReSym restored %d Go function symbols" % renamed, level="ok")
-    return renamed
+    return renamed, True
 
 
 def detect_sample_language():
@@ -803,6 +1233,8 @@ def apply_function_name(ea, name, append_address=False):
 
 def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None, append_address=False):
     emit("stage", "Renaming functions", stage="functions")
+    global RENAMED
+    RENAMED.clear()
     import idaapi
     import idc
     from omni_idb.rename_cache import fingerprint, is_cacheable_name
@@ -820,11 +1252,20 @@ def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None, a
     failed = 0
     round_index = 0
     cache_hits = 0
+    provider_errors_at_start = int(cfg.get("_terminal_provider_error_count") or 0)
 
     if cache:
-        for func in list(pending.values()):
+        total_cache = len(pending)
+        emit("progress", "Checking rename cache: 0/%d..." % total_cache, stage="functions", current=0, total=total_cache)
+        # Limit proactive cache check to top functions to prevent minute-long startup pauses
+        cache_check_items = list(pending.values())[:300] if total_cache > 500 else list(pending.values())
+        for c_idx, func in enumerate(cache_check_items):
+            if should_stop():
+                break
+            if (c_idx + 1) % 50 == 0 or c_idx + 1 == len(cache_check_items):
+                emit("progress", "Checking rename cache: %d/%d..." % (c_idx + 1, len(cache_check_items)), stage="functions", current=c_idx + 1, total=len(cache_check_items))
             func.name = idc.get_func_name(func.ea) or func.name
-            func.code = renamer.get_code_fast(func.ea, 50000, asm_max=1000)
+            func.code = renamer.get_code_fast(func.ea, 10000, asm_max=50)
             fp = fingerprint(func.code, own_name=func.name, user_functions=existing, image_range=image_range)
             hit = cache.lookup_function(fp)
             if hit:
@@ -834,32 +1275,62 @@ def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None, a
                     renamed += 1
                     cache_hits += 1
                     existing.add(final_name)
-                    RENAMED.append({"address": "0x%X" % func.ea, "old": func.name, "new": final_name})
+                    RENAMED.append({"address": "0x%X" % func.ea, "old": func.name, "new": final_name, "score": "Cached", "subs": 0, "status": "Reused (Cache)"})
                     emit("log", "[cache %s] %s -> %s" % (match_type, func.name, final_name), level="ok")
+                    emit("rename_function", address="0x%X" % func.ea, old=func.name, new=final_name, score="Cached", subs=0, status="Reused (Cache)")
                     pending.pop(func.ea, None)
         if cache_hits:
             emit("log", "Function rename cache: reused %d name(s)" % cache_hits, level="ok")
 
     while pending:
+        if should_stop():
+            emit("log", "Stop requested: saving IDB before exiting function rename pass...", level="warning")
+            break
         if tracker and not tracker.allowed(cfg.get("profile_name", "OpenAI"), cfg.get("url") or ""):
             emit("log", "Token budget reached; stopping function rename pass early", level="warning")
             break
 
         round_index += 1
         ready = []
-        for index, func in enumerate(list(pending.values())):
+        pending_list = list(pending.values())
+        total_pending = len(pending_list)
+        if total_pending > 100:
+            emit("progress", "Analyzing call dependencies (Round %d): 0/%d..." % (round_index, total_pending), stage="functions", current=0, total=total_pending)
+
+        has_fast_sub = hasattr(renamer, "count_sub_calls_fast")
+        for index, func in enumerate(pending_list):
+            if should_stop():
+                break
+            if total_pending > 100 and ((index + 1) % 200 == 0 or index + 1 == total_pending):
+                emit("progress", "Analyzing call dependencies (Round %d): %d/%d..." % (round_index, index + 1, total_pending), stage="functions", current=index + 1, total=total_pending)
             func.name = idc.get_func_name(func.ea) or func.name
-            func.code = renamer.get_code_fast(func.ea, 50000, asm_max=1000)
-            func.strings = renamer.get_strings_fast(func.ea)
-            func.calls = renamer.get_calls_fast(func.ea)
-            func.sub_count = renamer.count_sub_calls(func.code, own_name=func.name)
+
+            # Fast xref-based sub_* count avoids expensive Hex-Rays decompilation on non-ready functions
+            if has_fast_sub:
+                func.sub_count = renamer.count_sub_calls_fast(func.ea)
+            else:
+                if not getattr(func, "code", None):
+                    func.code = renamer.get_code_fast(func.ea, 50000, asm_max=1000)
+                func.sub_count = renamer.count_sub_calls(func.code, own_name=func.name)
+
             func.queue = "clear" if func.sub_count == 0 else "blocked"
             if func.queue == "clear":
+                if not getattr(func, "code", None):
+                    func.code = renamer.get_code_fast(func.ea, 50000, asm_max=1000)
+                func.strings = renamer.get_strings_fast(func.ea)
+                func.calls = renamer.get_calls_fast(func.ea)
                 ready.append((index, func))
 
-        if not ready:
+        if not ready and not should_stop():
             minimum = min(func.sub_count for func in pending.values())
             candidates = [func for func in pending.values() if func.sub_count == minimum]
+            for c in candidates[:60]:
+                if not getattr(c, "code", None):
+                    c.code = renamer.get_code_fast(c.ea, 50000, asm_max=1000)
+                if getattr(c, "strings", None) is None:
+                    c.strings = renamer.get_strings_fast(c.ea)
+                if getattr(c, "calls", None) is None:
+                    c.calls = renamer.get_calls_fast(c.ea)
             candidates.sort(key=lambda f: (len(f.strings or []), len(f.calls or [])), reverse=True)
             for index, func in enumerate(candidates[:30]):
                 func.status = "Pending (Cycle Breaker - %d sub_* remaining)" % func.sub_count
@@ -882,17 +1353,53 @@ def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None, a
             cfg, ready, existing,
             renamer.DEFAULT_BATCH_PROMPT if batch_sz > 1 else renamer.DEFAULT_PROMPT,
             batch_sz, is_retry=True,
-            is_low_score_rescan=not allow_rescan,
+            is_low_score_rescan=False,
         )
         if not allow_rescan:
             # Bypass single-function rescan cascade for significantly faster processing
             worker._rescan_low_score_results = lambda res: res
 
-        worker.batch_done.connect(lambda batch: results.extend(batch))
-        worker.log.connect(lambda message, level: emit("log", message, level=level))
-        worker.update_status.connect(lambda message: emit("log", message) if message else None)
+        worker.log = DirectSignal(lambda message, level="info": emit("log", message, level=level))
+        worker.update_status = DirectSignal(lambda message: emit("log", message, level="info") if message else None)
 
         batches = [ready[i:i + batch_sz] for i in range(0, len(ready), batch_sz)]
+        processed = set()
+
+        def _apply_result(res_tuple):
+            nonlocal renamed, failed
+            _index, func, suggestion, score = res_tuple
+            processed.add(func.ea)
+            pending.pop(func.ea, None)
+            if suggestion and suggestion not in ("DEFERRED", "DEFERRED_LOW_SCORE"):
+                from omni_idb.sanitizer import is_valid_identifier
+                if not is_valid_identifier(suggestion, score):
+                    failed += 1
+                    emit("log", "Discarded invalid/prose suggestion '%s' (%s) for 0x%X" % (
+                        suggestion, score or "unscored", func.ea), level="warning")
+                    return
+                ok, final_name = apply_function_name(func.ea, suggestion, append_address=append_address)
+                score_disp = ("%d%%" % int(score)) if (score and str(score).isdigit()) else (str(score) if score else "--")
+                sub_cnt = getattr(func, "sub_count", 0)
+                if ok:
+                    renamed += 1
+                    existing.add(final_name)
+                    RENAMED.append({"address": "0x%X" % func.ea, "old": func.name, "new": final_name, "score": score_disp, "subs": sub_cnt, "status": "Renamed"})
+                    emit("log", "%s -> %s (%s)" % (func.name, final_name, score or "unscored"), level="ok")
+                    emit("rename_function", address="0x%X" % func.ea, old=func.name, new=final_name, score=score_disp, subs=sub_cnt, status="Renamed")
+                    if cache and is_cacheable_name(suggestion):
+                        try:
+                            fp = fingerprint(func.code, own_name=func.name, user_functions=existing, image_range=image_range)
+                            cache.store_function(fp, suggestion, score=score)
+                        except Exception:
+                            pass
+                else:
+                    failed += 1
+                    emit("log", "IDA rejected function name %s at 0x%X" % (suggestion, func.ea), level="error")
+                    emit("rename_function", address="0x%X" % func.ea, old=func.name, new=suggestion, score=score_disp, subs=sub_cnt, status="Failed (Rejected)")
+            else:
+                failed += 1
+                emit("log", "No function rename produced for 0x%X" % func.ea, level="warning")
+                emit("rename_function", address="0x%X" % func.ea, old=func.name, new="--", score="--", subs=getattr(func, "sub_count", 0), status="Failed (No Name)")
 
         if num_workers > 1 and len(batches) > 1:
             import concurrent.futures
@@ -903,56 +1410,65 @@ def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None, a
             existing_lock = threading.Lock()
             orig_process_batch = worker.process_batch
 
-            def _process_one_batch(b):
-                if not getattr(worker, "running", True):
+            cooldown_sec = max(0, int(cfg.get("cooldown_seconds") or 0))
+
+            def _process_one_batch(item):
+                batch_num, b = item
+                if should_stop() or not getattr(worker, "running", True):
                     return []
-                res = orig_process_batch(b)
+                emit("log", f"[*] Batch {batch_num}/{len(batches)} started ({len(b)} functions)...", level="info")
+                try:
+                    res = orig_process_batch(b)
+                except Exception as ex:
+                    emit("log", f"[-] Batch {batch_num}/{len(batches)} error: {ex}", level="error")
+                    emit("error_event", f"Batch {batch_num}/{len(batches)} error: {ex}", stage="functions", severity="Error")
+                    return [(idx, f, None, "") for idx, f in b]
                 if allow_rescan and not getattr(worker, "is_low_score_rescan", False):
                     res = worker._rescan_low_score_results(res)
                 with existing_lock:
                     for _idx, _f, _name, _score in res:
                         if _name and _name not in ("DEFERRED", "DEFERRED_LOW_SCORE"):
                             worker.existing.add(_name)
+                if cooldown_sec > 0:
+                    import time
+                    time.sleep(cooldown_sec)
                 return res
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_workers, len(batches))) as executor:
-                futures = [executor.submit(_process_one_batch, b) for b in batches]
+                futures = [executor.submit(_process_one_batch, (idx + 1, b)) for idx, b in enumerate(batches)]
                 done_count = 0
                 for f in concurrent.futures.as_completed(futures):
+                    if should_stop():
+                        break
                     try:
                         b_res = f.result()
                         if b_res:
-                            results.extend(b_res)
                             done_count += len(b_res)
+                            emit("log", "✓ Batch finished (%d/%d functions in round)" % (done_count, len(ready)), level="ok")
                             emit("progress", "Batch completed (%d/%d functions in round)" % (done_count, len(ready)),
                                  stage="functions", current=len(sub_functions) - len(pending) + done_count, total=len(sub_functions))
+                            for item in b_res:
+                                _apply_result(item)
                     except Exception as e:
                         emit("log", "Parallel batch error: %s" % e, level="error")
         else:
+            orig_worker_run = worker.run
+            def _stop_aware_run():
+                done_count = 0
+                for idx, b in enumerate(batches):
+                    if should_stop() or not getattr(worker, "running", True):
+                        break
+                    emit("log", f"[*] Batch {idx + 1}/{len(batches)} started ({len(b)} functions)...", level="info")
+                    b_res = worker.process_batch(b)
+                    if b_res:
+                        done_count += len(b_res)
+                        emit("log", "✓ Batch finished (%d/%d functions in round)" % (done_count, len(ready)), level="ok")
+                        emit("progress", "Batch completed (%d/%d functions in round)" % (done_count, len(ready)),
+                             stage="functions", current=len(sub_functions) - len(pending) + done_count, total=len(sub_functions))
+                        for item in b_res:
+                            _apply_result(item)
+            worker.run = _stop_aware_run
             worker.run()
-
-        processed = set()
-        for _index, func, suggestion, score in results:
-            processed.add(func.ea)
-            if suggestion and suggestion not in ("DEFERRED", "DEFERRED_LOW_SCORE"):
-                ok, final_name = apply_function_name(func.ea, suggestion, append_address=append_address)
-                if ok:
-                    renamed += 1
-                    existing.add(final_name)
-                    RENAMED.append({"address": "0x%X" % func.ea, "old": func.name, "new": final_name})
-                    emit("log", "%s -> %s (%s)" % (func.name, final_name, score or "unscored"), level="ok")
-                    if cache and is_cacheable_name(suggestion):
-                        try:
-                            fp = fingerprint(func.code, own_name=func.name, user_functions=existing, image_range=image_range)
-                            cache.store_function(fp, suggestion, score=score)
-                        except Exception:
-                            pass
-                else:
-                    failed += 1
-                    emit("log", "IDA rejected function name %s at 0x%X" % (suggestion, func.ea), level="error")
-            else:
-                failed += 1
-                emit("log", "No function rename produced for 0x%X" % func.ea, level="warning")
 
         # A worker emits one terminal result per item. Guard against provider
         # or Qt failures so an unattended job cannot loop forever.
@@ -960,13 +1476,23 @@ def run_function_rename(sub_functions, cfg, renamer, cache=None, tracker=None, a
             if func.ea not in processed:
                 failed += 1
                 emit("log", "Function worker produced no result for 0x%X" % func.ea, level="error")
-            pending.pop(func.ea, None)
+                pending.pop(func.ea, None)
 
-    return {"candidates": len(sub_functions), "renamed": renamed, "failed": failed, "cache_hits": cache_hits}
+    provider_errors = int(cfg.get("_terminal_provider_error_count") or 0) - provider_errors_at_start
+    if provider_errors > 0 and renamed <= cache_hits:
+        detail = cfg.get("_last_terminal_provider_error") or "unknown provider error"
+        raise RuntimeError("Function rename provider failed: %s" % detail)
+
+    return {"candidates": len(sub_functions), "renamed": renamed, "failed": failed, "cache_hits": cache_hits, "items": list(RENAMED)}
 
 
 def run_variable_rename(sub_functions, cfg, var_renamer, cache=None, tracker=None):
+    if should_stop():
+        emit("log", "Stop requested: skipping variable rename to save IDB...", level="warning")
+        return {"candidates": len(sub_functions), "renamed": 0, "failed": 0, "cache_hits": 0, "items": []}
     emit("stage", "Renaming variables", stage="variables")
+    global RENAMED_VARS
+    RENAMED_VARS.clear()
     import idc
     import ida_hexrays
     import idaapi
@@ -988,7 +1514,14 @@ def run_variable_rename(sub_functions, cfg, var_renamer, cache=None, tracker=Non
     cache_hits = 0
     remaining_items = []
 
-    for index, func in all_items:
+    total_var_items = len(all_items)
+    if cache and total_var_items > 100:
+        emit("progress", "Checking variable rename cache: 0/%d..." % total_var_items, stage="variables", current=0, total=total_var_items)
+    for c_idx, (index, func) in enumerate(all_items):
+        if should_stop():
+            break
+        if cache and total_var_items > 100 and ((c_idx + 1) % 100 == 0 or c_idx + 1 == total_var_items):
+            emit("progress", "Checking variable rename cache: %d/%d..." % (c_idx + 1, total_var_items), stage="variables", current=c_idx + 1, total=total_var_items)
         cached = False
         if cache:
             try:
@@ -1013,6 +1546,25 @@ def run_variable_rename(sub_functions, cfg, var_renamer, cache=None, tracker=Non
                                 cache_hits += applied
                                 cached = True
                                 emit("log", "[cache %s] 0x%X: reused %d variable(s)" % (kind, func.ea, applied), level="ok")
+                                details_str = ", ".join(f"{d.get('old')} -> {d.get('new')}" for d in details) if isinstance(details, list) else str(details or "")
+                                status_str = "Complete (Cached)"
+                                RENAMED_VARS.append({
+                                    "address": "0x%X" % func.ea,
+                                    "func_name": func.name,
+                                    "applied": applied,
+                                    "rejected": rejected,
+                                    "details": details_str,
+                                    "status": status_str,
+                                })
+                                emit(
+                                    "rename_variable",
+                                    address="0x%X" % func.ea,
+                                    func_name=func.name,
+                                    applied=applied,
+                                    rejected=rejected,
+                                    details=details_str,
+                                    status=status_str,
+                                )
             except Exception:
                 pass
         if not cached:
@@ -1035,9 +1587,9 @@ def run_variable_rename(sub_functions, cfg, var_renamer, cache=None, tracker=Non
             total=len(remaining_items),
         )
         worker = var_renamer.VarRenameWorker(cfg, remaining_items, is_retry=True)
+        worker.log = DirectSignal(lambda message, level="info": emit("log", message, level=level))
+        worker.update_status = DirectSignal(lambda message: emit("log", message, level="info") if message else None)
         worker.batch_done.connect(lambda batch: results.extend(batch))
-        worker.log.connect(lambda message, level: emit("log", message, level=level))
-        worker.update_status.connect(lambda message: emit("log", message) if message else None)
         worker.run()
 
         for _index, func, suggestions in results:
@@ -1068,6 +1620,25 @@ def run_variable_rename(sub_functions, cfg, var_renamer, cache=None, tracker=Non
                 level="ok" if applied else "warning",
                 details=details,
             )
+            details_str = ", ".join(f"{d.get('old')} -> {d.get('new')}" for d in details) if isinstance(details, list) else str(details or "")
+            status_str = "Complete" if applied > 0 else ("Rejected" if rejected > 0 else "No Changes")
+            RENAMED_VARS.append({
+                "address": "0x%X" % func.ea,
+                "func_name": func.name,
+                "applied": applied,
+                "rejected": rejected,
+                "details": details_str,
+                "status": status_str,
+            })
+            emit(
+                "rename_variable",
+                address="0x%X" % func.ea,
+                func_name=func.name,
+                applied=applied,
+                rejected=rejected,
+                details=details_str,
+                status=status_str,
+            )
             if cache and applied and pre_rename_fp:
                 try:
                     canonical_map = {name: i for i, name in enumerate(pre_rename_fp.var_order)}
@@ -1083,10 +1654,14 @@ def run_variable_rename(sub_functions, cfg, var_renamer, cache=None, tracker=Non
         "variables_renamed": variables_renamed,
         "failed": failed,
         "cache_hits": cache_hits,
+        "items": list(RENAMED_VARS),
     }
 
 
 def run_autonomous_investigation(job, cfg, renamer):
+    if should_stop():
+        emit("log", "Stop requested: skipping investigation to save IDB...", level="warning")
+        return {"turns": 0, "findings": [], "status": "stopped"}
     emit("stage", "Investigating sample", stage="investigation")
     import idaapi
     import idc
@@ -1149,6 +1724,9 @@ def run_autonomous_investigation(job, cfg, renamer):
     turn_executed = 0
 
     for turn in range(1, max_turns + 1):
+        if should_stop():
+            emit("log", "Stop requested: saving IDB and halting investigation early...", level="warning")
+            break
         turn_executed = turn
         emit(
             "progress",
@@ -1239,8 +1817,13 @@ def run_autonomous_investigation(job, cfg, renamer):
                 session.record_observation(t_name, t_args, tool_res)
                 emit("log", "[Agent] Finding: %s [%s]" % (finding.claim[:100], finding.confidence), level="ok")
             elif t_name == "mark_examined":
+                raw_ea = t_args.get("ea", entry_ea)
+                try:
+                    parsed_ea = int(str(raw_ea), 0) if isinstance(raw_ea, str) else int(raw_ea)
+                except (ValueError, TypeError):
+                    parsed_ea = entry_ea
                 session.mark_examined(
-                    t_args.get("ea", entry_ea),
+                    parsed_ea,
                     t_args.get("disposition", "examined"),
                     t_args.get("summary", ""),
                 )
@@ -1248,7 +1831,12 @@ def run_autonomous_investigation(job, cfg, renamer):
                 session.record_result(t_name, t_args, tool_res)
                 session.record_observation(t_name, t_args, tool_res)
             elif t_name == "record_function_analysis":
-                session.remember_function(t_args.get("ea", entry_ea), t_args)
+                raw_ea = t_args.get("ea", entry_ea)
+                try:
+                    parsed_ea = int(str(raw_ea), 0) if isinstance(raw_ea, str) else int(raw_ea)
+                except (ValueError, TypeError):
+                    parsed_ea = entry_ea
+                session.remember_function(parsed_ea, t_args)
                 tool_res = "Recorded function analysis."
                 session.record_result(t_name, t_args, tool_res)
                 session.record_observation(t_name, t_args, tool_res)
@@ -1374,14 +1962,19 @@ def save_original_idb(job):
     path = str(job.get("original_idb_path") or "")
     if not path:
         return ""
-    import ida_loader
-
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
+    alt_ext = ".idb" if str(target).lower().endswith(".i64") else ".i64"
+    alt_target = target.with_suffix(alt_ext)
+
+    if job.get("is_resume") or target.is_file() or alt_target.is_file():
+        preserved = str(target if target.is_file() else alt_target)
+        emit("log", "Original IDB preserved: %s" % preserved, level="ok")
+        return preserved
+
+    import ida_loader
     emit("stage", "Saving original IDB before AI changes", stage="save")
     if not ida_loader.save_database(str(target), ida_loader.DBFL_COMP):
-        alt_ext = ".idb" if str(target).lower().endswith(".i64") else ".i64"
-        alt_target = target.with_suffix(alt_ext)
         if not ida_loader.save_database(str(alt_target), ida_loader.DBFL_COMP):
             raise RuntimeError("IDA could not save the original database to %s" % target)
         target = alt_target
@@ -1652,17 +2245,20 @@ def _run_cli_agent_workspace(provider, executable, model, ws_path, prompt, timeo
     raw_output = proc.stdout.strip() or proc.stderr.strip()
 
     # Detect if agent (e.g. Antigravity CLI / agy) wrote an artifact report file and only printed a summary
-    # e.g.: [report_name.md](file:///C:/Users/.../report_name.md)
+    # e.g.: [report_name.md](file:///C:/Users/.../report_name.md) or (file:///home/user/...)
     import re
     import urllib.parse
-    artifact_pattern = re.search(r"\[([^\]]+\.md)\]\((file:///[^\)]+)\)", raw_output, re.IGNORECASE)
+    artifact_pattern = re.search(r"\[([^\]]+\.md)\]\((file://[^\)]+)\)", raw_output, re.IGNORECASE)
     if artifact_pattern:
         file_url = artifact_pattern.group(2)
         try:
             parsed = urllib.parse.urlparse(file_url)
-            local_path = urllib.parse.unquote(parsed.path)
-            if local_path.startswith("/") and len(local_path) > 3 and local_path[2] == ":":
-                local_path = local_path[1:]
+            if parsed.netloc and len(parsed.netloc) >= 2 and parsed.netloc[1] == ":":
+                local_path = parsed.netloc + parsed.path
+            else:
+                local_path = urllib.parse.unquote(parsed.path)
+                if local_path.startswith("/") and len(local_path) > 3 and local_path[2] == ":":
+                    local_path = local_path[1:]
             art_file = Path(local_path)
             if art_file.is_file() and art_file.stat().st_size > len(raw_output):
                 full_content = art_file.read_text(encoding="utf-8", errors="replace")
@@ -1725,6 +2321,9 @@ def _build_workspace_context_prompt(ws, base_prompt):
 
 def run_workspace_analysis(job, cfg, renamer, workspace_path):
     """Analyze an exported workspace, preserving primary-first provider order."""
+    if should_stop():
+        emit("log", "Stop requested: skipping workspace analysis to save IDB...", level="warning")
+        return None
     profile = job.get("profile") or {}
 
     provider = str(profile.get("provider") or job.get("provider") or PROVIDER_INFO.get("active") or "").strip()
@@ -1879,6 +2478,9 @@ def run_workspace_analysis(job, cfg, renamer, workspace_path):
 
 def main():
     job = load_args()
+    global CURRENT_JOB
+    CURRENT_JOB.clear()
+    CURRENT_JOB.update(job)
     repo_root = str(Path(job.get("genesect_root", "")).resolve()) if job.get("genesect_root") else ""
     if repo_root and repo_root not in sys.path:
         sys.path.insert(0, repo_root)
@@ -1933,7 +2535,8 @@ def main():
     try:
         sample_file = job.get("sample_path", "")
         if sample_file:
-            if pre_process_go_symbols(sample_file, job.get("goresym_path", "")) > 0:
+            go_renamed, is_go_binary = pre_process_go_symbols(sample_file, job.get("goresym_path", ""))
+            if go_renamed > 0 or is_go_binary:
                 go_detected = True
     except Exception as exc:
         emit("log", "Go symbol pre-processing skipped: %s" % exc, level="warning")
@@ -1948,6 +2551,8 @@ def main():
             detected_lang = detect_sample_language()
         except Exception as exc:
             emit("log", "Sample language detection check encountered error: %s" % exc, level="warning")
+    if detected_lang:
+        emit("log", "[*] Binary environment: %s identified" % detected_lang, level="info")
 
     # Detect packers, code virtualization, and protectors
     protections = []
@@ -2049,9 +2654,9 @@ def main():
             }
         else:
             result["variable_rename"] = run_variable_rename(sub_functions, cfg, var_renamer, cache=cache, tracker=tracker)
-    if job.get("autonomous_investigation"):
+    if job.get("autonomous_investigation") and not should_stop():
         result["autonomous_investigation"] = run_autonomous_investigation(job, cfg, renamer)
-    if job.get("autonomous_investigation") and job.get("report_dir"):
+    if job.get("autonomous_investigation") and job.get("report_dir") and not should_stop():
         try:
             report_stats = {
                 "variables_renamed": (result.get("variable_rename") or {}).get("variables_renamed", 0),
@@ -2062,7 +2667,7 @@ def main():
             emit("log", "Report generation failed: %s" % exc, level="error", traceback=traceback.format_exc())
             result["report"] = {"error": str(exc)}
 
-    if job.get("generate_workspace"):
+    if job.get("generate_workspace") and not should_stop():
         workspace_path = str(Path(job["workspace_path"]).resolve())
         emit("stage", "Exporting AI workspace", stage="workspace")
         original_names_map = {int(item["address"], 16): item["old"] for item in RENAMED if item.get("address") and item.get("old")}
@@ -2119,14 +2724,38 @@ def main():
         idb_path = alt_path
         job["idb_path"] = alt_path
     result["idb_path"] = idb_path
+    emit("log", "Analyzed IDB saved: %s" % idb_path, level="ok")
 
     result_path = Path(job["result_path"])
     result_path.parent.mkdir(parents=True, exist_ok=True)
+    if should_stop():
+        result["status"] = "stopped"
+        result["stopped_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        result["provider"] = dict(PROVIDER_INFO)
+        result_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+        emit("complete", "Sample stopped and saved safely by user. Ready to resume.", result=result)
+        _close_events_file()
+        ida_pro.qexit(0)
+        return
+
     result["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     result["provider"] = dict(PROVIDER_INFO)
     result_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     emit("complete", "Sample completed", result=result)
+    _close_events_file()
     ida_pro.qexit(0)
+
+
+def _close_events_file() -> None:
+    global _EVENTS_HANDLE
+    if _EVENTS_HANDLE is not None:
+        try:
+            if not _EVENTS_HANDLE.closed:
+                _EVENTS_HANDLE.flush()
+                _EVENTS_HANDLE.close()
+        except Exception:
+            pass
+        _EVENTS_HANDLE = None
 
 
 if __name__ == "__main__":
@@ -2135,6 +2764,7 @@ if __name__ == "__main__":
     except Exception as exc:
         details = traceback.format_exc()
         emit("error", str(exc), traceback=details)
+        _close_events_file()
         try:
             args = load_args()
             failure_path = Path(args.get("failure_path") or "")

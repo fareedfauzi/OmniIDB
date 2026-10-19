@@ -62,6 +62,7 @@ class RunRequest:
     api_key: str
     samples: list[Sample]
     fallback_api_key: str = ""
+    is_resume: bool = False
 
 
 def _post(q: "queue.Queue[RunnerEvent]", kind: str, **data: Any) -> None:
@@ -102,14 +103,33 @@ def _run_all(request: RunRequest, q, cancelled: threading.Event) -> None:
                         remaining_budget = max(0, remaining_budget - billable)
                         if remaining_budget == 0:
                             _post(q, "log", message="Batch token budget has been fully consumed.")
+        except InterruptedError as stop_err:
+            message = str(stop_err)
+            _post(q, "sample_finished", index=index, ok=False, stopped=True, message=message)
+            _post(q, "log", message=f"⏹ {message}")
+            break
         except Exception as error:  # noqa: BLE001 - every failure is reported per sample
             failed += 1
-            message = f"{sample.path}: {error}"
+            err_lines = str(error).strip().splitlines()
+            err_summary = err_lines[0] if err_lines else "Unknown execution error"
+            err_diag = "\n".join(err_lines[1:]) if len(err_lines) > 1 else f"Path: {sample.path}"
+            _post(
+                q,
+                "error_event",
+                time=time.strftime("%H:%M:%S"),
+                severity="Error",
+                stage=getattr(sample, "stage", None) if getattr(sample, "stage", "-") != "-" else "Execution",
+                sample=sample.path.name,
+                message=err_summary,
+                details=err_diag,
+                index=index,
+            )
+            message = f"{sample.path.name}: {error}"
             _post(q, "log", message=message)
-            _post(q, "sample_finished", index=index, ok=False, message=message)
+            _post(q, "sample_finished", index=index, ok=False, stopped=False, message=message)
         else:
             succeeded += 1
-            _post(q, "sample_finished", index=index, ok=True, message=message)
+            _post(q, "sample_finished", index=index, ok=True, stopped=False, message=message, result=sample_result)
     was_cancelled = cancelled.is_set()
     if batch_tokens > 0:
         cost_str = f" (~${batch_cost:.3f})" if batch_cost > 0 else ""
@@ -119,9 +139,9 @@ def _run_all(request: RunRequest, q, cancelled: threading.Event) -> None:
         "progress",
         current=succeeded + failed,
         total=total,
-        message="Cancelled" if was_cancelled else "Complete",
+        message="Stopped" if was_cancelled else "Complete",
     )
-    _post(q, "batch_finished", succeeded=succeeded, failed=failed, cancelled=was_cancelled)
+    _post(q, "batch_finished", succeeded=succeeded, failed=failed, cancelled=was_cancelled, stopped=was_cancelled, can_resume=was_cancelled)
 
 
 def sanitize(value: str) -> str:
@@ -140,7 +160,10 @@ def sha256_file(path: Path) -> str:
 def ida_script_argument(script: Path | str, job: Path | str) -> str:
     # In IDA Pro, -S runs the IDAPython script. Job payload is safely communicated
     # via OMNI_IDB_JOB_FILE in the process environment to prevent argument splitting.
-    return f'-S"{script}"'
+    # On Windows cmdline, embedded quotes are needed; on Unix, quotes must NOT be in argv.
+    if sys.platform == "win32":
+        return f'-S"{script}"'
+    return f"-S{script}"
 
 
 def remove_previous_run_files(paths) -> None:
@@ -151,6 +174,19 @@ def remove_previous_run_files(paths) -> None:
             pass
         except OSError as error:
             raise OSError(f"Could not replace previous output {artifact}: {error}") from error
+
+
+def clean_stray_idb_fragments(directory: Path | str) -> None:
+    """Clean up any abandoned unpacked IDA temporary database fragments (.id0, .id1, .id2, .nam, .til)."""
+    dir_path = Path(directory)
+    if not dir_path.is_dir():
+        return
+    for pattern in ("*.id0", "*.id1", "*.id2", "*.nam", "*.til", "*.idb~", "*.i64~"):
+        for stray in dir_path.glob(pattern):
+            try:
+                stray.unlink()
+            except OSError:
+                pass
 
 
 def _tail(text: str, maximum: int) -> str:
@@ -166,10 +202,17 @@ def _spawn_ida(ida: Path, args: list[str], script_arg: str, sample_path: Path, e
         # list2cmdline would backslash-escape the embedded quotes.
         cmdline = " ".join([subprocess.list2cmdline([str(ida), *args]), script_arg, subprocess.list2cmdline([str(sample_path)])])
         return subprocess.Popen(cmdline, **kwargs)
-    return subprocess.Popen([str(ida), *args, script_arg, str(sample_path)], **kwargs)
+
+    # On POSIX (Linux and macOS), arguments are passed as discrete elements in the argv list.
+    # Embedded quotation marks must NOT be included in script_arg on POSIX, otherwise
+    # IDA tries to find a script literally named '"path/to/script.py"'.
+    clean_script_arg = script_arg
+    if clean_script_arg.startswith('-S"') and clean_script_arg.endswith('"'):
+        clean_script_arg = "-S" + clean_script_arg[3:-1]
+    return subprocess.Popen([str(ida), *args, clean_script_arg, str(sample_path)], **kwargs)
 
 
-def _tail_file(path: Path, stop: threading.Event, q, index: Optional[int] = None) -> None:
+def _tail_file(path: Path, stop: threading.Event, q, index: Optional[int] = None, seen_events: Optional[set] = None) -> None:
     handle = None
     pending = ""
 
@@ -186,7 +229,7 @@ def _tail_file(path: Path, stop: threading.Event, q, index: Optional[int] = None
                 if line:
                     _post(q, "ida_log_line", message=line)
                     if index is not None:
-                        _handle_ida_line(index, line, q)
+                        _handle_ida_line(index, line, q, seen_events=seen_events)
             else:
                 break
 
@@ -208,6 +251,44 @@ def _tail_file(path: Path, stop: threading.Event, q, index: Optional[int] = None
     handle.close()
 
 
+def _tail_events_file(path: Path, stop: threading.Event, q, index: int, seen_events: set) -> None:
+    """Zero-latency event tailer reading directly from the unbuffered events.jsonl file."""
+    handle = None
+    pending = ""
+
+    def drain(final: bool) -> None:
+        nonlocal pending
+        while True:
+            chunk = handle.readline()
+            if not chunk:
+                break
+            pending += chunk
+            if pending.endswith("\n") or final:
+                line = pending.rstrip("\r\n")
+                pending = ""
+                if line:
+                    _handle_ida_line(index, line, q, seen_events=seen_events)
+            else:
+                break
+
+    while not stop.is_set():
+        if handle is None:
+            try:
+                handle = open(path, "r", encoding="utf-8", errors="replace")
+            except OSError:
+                handle = None
+        if handle is not None:
+            drain(False)
+        time.sleep(0.04)
+    if handle is None:
+        try:
+            handle = open(path, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            return
+    drain(True)
+    handle.close()
+
+
 def _pipe_lines(stream, out: "queue.Queue[str]") -> None:
     def pump() -> None:
         try:
@@ -220,7 +301,7 @@ def _pipe_lines(stream, out: "queue.Queue[str]") -> None:
 
 
 def _is_64bit_sample(path: Path) -> bool:
-    """Fast header probe to determine if sample is 64-bit (PE, ELF, Mach-O)."""
+    """Fast header probe to determine if sample is 64-bit (PE, ELF, Mach-O single & universal)."""
     try:
         with open(path, "rb") as f:
             header = f.read(1024)
@@ -236,46 +317,90 @@ def _is_64bit_sample(path: Path) -> bool:
         # ELF check
         if header[:4] == b"\x7fELF":
             return header[4] == 2  # 1 = 32-bit, 2 = 64-bit
-        # Mach-O check
+        # Mach-O single slice 64-bit: 0xfeedfacf (big), 0xcffaedfe (little)
         if header[:4] in (b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe"):
             return True
+        # Mach-O single slice 32-bit: 0xfeedface (big), 0xcefaedfe (little)
         if header[:4] in (b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe"):
             return False
+        # Mach-O Fat / Universal binary:
+        # 0xcafebabe (big-endian fat), 0xbebafeca (little-endian fat)
+        # 0xcafebabf (big-endian fat_arch_64), 0xbfbafeca (little-endian fat_arch_64)
+        if header[:4] in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"):
+            endian = "big" if header[:4] in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf") else "little"
+            is_fat64 = header[:4] in (b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca")
+            nfat = int.from_bytes(header[4:8], endian)
+            if 1 <= nfat <= 32:
+                stride = 32 if is_fat64 else 20
+                for i in range(nfat):
+                    entry_off = 8 + i * stride
+                    if len(header) < entry_off + 4:
+                        break
+                    cputype = int.from_bytes(header[entry_off : entry_off + 4], endian)
+                    # CPU_ARCH_ABI64 = 0x01000000 (e.g. x86_64 = 0x01000007, ARM64 = 0x0100000C)
+                    if (cputype & 0x01000000) != 0 or is_fat64:
+                        return True
+                return False
     except OSError:
         pass
     return True
 
 
 def _resolve_ida_binary(configured_ida: Path, is_64: bool) -> Path:
-    """Auto-select between ida.exe and ida64.exe (or idat.exe and idat64.exe) in IDA <= 8.4."""
+    """Auto-select between ida and ida64 (or idat and idat64, or Windows .exe variants, or macOS .app bundles)."""
     if not configured_ida.is_file():
         return configured_ida
     folder = configured_ida.parent
     stem = configured_ida.stem.lower()
     ext = configured_ida.suffix
 
+    target_stem = ""
     if is_64 and stem in ("ida", "idat"):
-        cand = folder / f"{stem}64{ext}"
-        if cand.is_file():
-            return cand
+        target_stem = f"{stem}64"
     elif not is_64 and stem in ("ida64", "idat64"):
-        base_stem = stem[:-2]
-        cand = folder / f"{base_stem}{ext}"
-        if cand.is_file():
-            return cand
+        target_stem = stem[:-2]
+
+    if not target_stem:
+        return configured_ida
+
+    # 1. Direct sibling binary (e.g. ida64.exe next to ida.exe or idat64 next to idat)
+    cand = folder / f"{target_stem}{ext}"
+    if cand.is_file():
+        return cand
+
+    # 2. Check macOS app bundle structure:
+    # e.g. configured_ida = /Applications/IDA Professional 9.0/ida64.app/Contents/MacOS/ida64
+    # sibling would be    = /Applications/IDA Professional 9.0/ida.app/Contents/MacOS/ida
+    if folder.name == "MacOS" and folder.parent.name == "Contents" and folder.parent.parent.suffix == ".app":
+        app_dir = folder.parent.parent.parent
+        target_app = app_dir / f"{target_stem}.app" / "Contents" / "MacOS" / target_stem
+        if target_app.is_file():
+            return target_app
+
     return configured_ida
+
+
+def sample_output_folder(sample_path: Path) -> str:
+    """Generate the standardized output folder name for a given sample."""
+    digest = sha256_file(sample_path)
+    return f"{sanitize(sample_path.stem)}-{digest[:12]}"
+
+
+def idb_extension(is_64: bool) -> str:
+    """Return database extension (.i64 for 64-bit, .idb for 32-bit)."""
+    return ".i64" if is_64 else ".idb"
 
 
 def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: threading.Event, remaining_budget: Optional[int] = None) -> tuple[str, dict]:
     settings = request.settings
-    digest = sha256_file(sample.path)
-    folder = f"{sanitize(sample.path.stem)}-{digest[:12]}"
+    folder = sample_output_folder(sample.path)
     output_root = Path(settings.output_root.strip()) / folder
     idb_dir = output_root / "IDB Files"
     workspace = output_root / "AI Workspace"
     report_dir = output_root / "report"
     logs = output_root / "logs"
     logs.mkdir(parents=True, exist_ok=True)
+    digest = sha256_file(sample.path)
     is_64 = sample.path.suffix.lower() == ".i64" if sample.kind == SampleKind.IDA_DATABASE else _is_64bit_sample(sample.path)
     db_ext = ".i64" if is_64 else ".idb"
     idb_path = idb_dir / f"analyzed{db_ext}"
@@ -283,6 +408,7 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
     result_path = output_root / "result.json"
     failure_path = logs / "failure.txt"
     ida_log = logs / "ida.log"
+    events_log = logs / "events.jsonl"
 
     # .NET Assembly special handling (does not require IDA Pro)
     if sample.kind == SampleKind.DOTNET_ASSEMBLY:
@@ -391,14 +517,62 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
     if not script.is_file():
         raise FileNotFoundError(f"OmniIDB batch script not found: {script}")
 
-    # Output folders are deterministic. IDA prompts instead of overwriting an
-    # existing database and a stale failure file can mask a new failure, so
-    # remove only the generated per-run files first.
-    remove_previous_run_files([idb_path, original_idb_path, idb_dir / "analyzed.i64", idb_dir / "analyzed.idb", idb_dir / "original.i64", idb_dir / "original.idb", result_path, failure_path, ida_log])
+    is_resume = getattr(request, "is_resume", False)
+    idb_ext = idb_extension(is_64)
+    idb_path = idb_dir / f"analyzed{idb_ext}"
+    alt_idb_path = idb_dir / f"analyzed{'.idb' if is_64 else '.i64'}"
+    original_idb_path = idb_dir / f"original{idb_ext}"
+    result_path = report_dir / "result.json"
+    stop_file = report_dir / "stop_requested.token"
+
+    if stop_file.is_file():
+        try:
+            stop_file.unlink()
+        except OSError:
+            pass
+
+    existing_idb = None
+    if is_resume:
+        if idb_path.is_file():
+            existing_idb = idb_path
+        elif alt_idb_path.is_file():
+            existing_idb = alt_idb_path
+
+    # If resuming and this sample was already completed, skip it
+    if is_resume and result_path.is_file():
+        try:
+            prev_res = json.loads(result_path.read_text(encoding="utf-8"))
+            if prev_res.get("status") not in ("stopped", "failed") and prev_res.get("completed_at"):
+                _post(q, "sample_status", index=index, status="Already Complete")
+                _post(q, "log", message=f"Sample {sample.path.name} was already completed in this output directory; skipping.")
+                return f"Already Complete ({sample.path.name})", prev_res
+        except Exception:
+            pass
+
+    # Clean up any leftover unpacked database temporary fragments (.id0, .id1, .id2, .nam, .til)
+    # in idb_dir so that IDA does not pause and abort on overwrite prompts when opening .i64/.idb.
+    clean_stray_idb_fragments(idb_dir)
+
+    if is_resume and existing_idb and existing_idb.is_file():
+        remove_previous_run_files([failure_path, events_log, stop_file])
+        target_input = existing_idb
+        args = ["-A", f"-L{ida_log}"]
+        _post(q, "log", message=f"Resuming analysis from saved database: {existing_idb.name}")
+    else:
+        remove_previous_run_files([
+            idb_path, original_idb_path, idb_dir / "analyzed.i64", idb_dir / "analyzed.idb",
+            idb_dir / "original.i64", idb_dir / "original.idb", result_path, failure_path, ida_log, events_log, stop_file
+        ])
+        target_input = sample.path
+        args = ["-A", f"-L{ida_log}", f"-o{idb_path}"]
 
     job = {
         "omni_root": str(project_root().resolve()),
         "sample_path": str(sample.path.resolve()),
+        "target_path": str(target_input.resolve()),
+        "events_path": str(events_log.resolve()),
+        "is_resume": bool(is_resume and existing_idb),
+        "stop_file": str(stop_file.resolve()),
         "genesect_root": str((find_genesect_package_root(genesect_root, ida.parent) or genesect_root).resolve()),
         "idb_path": str(idb_path),
         "original_idb_path": str(original_idb_path),
@@ -447,16 +621,15 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(job, handle, indent=2)
 
-        args = ["-A", f"-L{ida_log}", f"-o{idb_path}"]
-
         env = os.environ.copy()
         for name in ("VIRTUAL_ENV", "__PYVENV_LAUNCHER__", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE", "PYTHONINSPECT"):
             env.pop(name, None)
         env["OMNI_IDB_JOB_FILE"] = str(job_file.resolve())
+        env["OMNI_IDB_EVENTS_FILE"] = str(events_log.resolve())
 
         _post(q, "sample_status", index=index, status="Running in IDA")
         try:
-            child = _spawn_ida(ida, args, ida_script_argument(script, job_file), sample.path, env)
+            child = _spawn_ida(ida, args, ida_script_argument(script, job_file), target_input, env)
         except OSError as error:
             raise OSError(f"Could not start {ida}: {error}") from error
 
@@ -464,30 +637,68 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
         _pipe_lines(child.stdout, lines)
         _pipe_lines(child.stderr, lines)
         stop_tail = threading.Event()
-        tail_thread = threading.Thread(target=_tail_file, args=(ida_log, stop_tail, q, index), daemon=True)
+        seen_events: set = set()
+        tail_thread = threading.Thread(target=_tail_file, args=(ida_log, stop_tail, q, index, seen_events), daemon=True)
         tail_thread.start()
+        events_thread = threading.Thread(target=_tail_events_file, args=(events_log, stop_tail, q, index, seen_events), daemon=True)
+        events_thread.start()
 
         def flush_lines() -> None:
             while True:
                 try:
-                    _handle_ida_line(index, lines.get_nowait(), q)
+                    _handle_ida_line(index, lines.get_nowait(), q, seen_events=seen_events)
                 except queue.Empty:
                     return
 
+        stopped_gracefully = False
         while True:
             flush_lines()
             if cancelled.is_set():
+                _post(q, "sample_status", index=index, status="Saving IDB & Stopping...")
+                _post(q, "log", message="Stop requested: instructing IDA to save database and exit gracefully...", level="warning")
+                try:
+                    stop_file.write_text("stop", encoding="utf-8")
+                except OSError:
+                    pass
+
+                # Give IDA up to 15 seconds to finish its current batch, save database, and exit cleanly
+                grace_timeout = 15.0
+                start_grace = time.time()
+                while time.time() - start_grace < grace_timeout:
+                    flush_lines()
+                    code = child.poll()
+                    if code is not None:
+                        stopped_gracefully = True
+                        break
+                    time.sleep(0.15)
+
                 stop_tail.set()
-                tail_thread.join()
-                child.kill()
-                child.wait()
-                raise RuntimeError("Cancelled by user")
+                tail_thread.join(timeout=2.0)
+                events_thread.join(timeout=2.0)
+                flush_lines()
+
+                try:
+                    if stop_file.is_file():
+                        stop_file.unlink()
+                except OSError:
+                    pass
+
+                if not stopped_gracefully:
+                    _post(q, "log", message="IDA did not exit within grace timeout; terminating process.", level="warning")
+                    child.kill()
+                    child.wait()
+                else:
+                    _post(q, "log", message="Database saved. Session stopped cleanly. Click 'Resume' to continue where you left off.", level="ok")
+
+                raise InterruptedError("Stopped by user (IDB saved)")
+
             code = child.poll()
             if code is not None:
                 break
             time.sleep(0.12)
         stop_tail.set()
-        tail_thread.join()
+        tail_thread.join(timeout=2.0)
+        events_thread.join(timeout=2.0)
         time.sleep(0.05)
         flush_lines()
     finally:
@@ -505,7 +716,7 @@ def _run_one(index: int, sample: Sample, request: RunRequest, q, cancelled: thre
             except OSError:
                 continue
         raise RuntimeError(f"IDA exited with {code}\n{_tail(details, 5000)}")
-    if not idb_path.is_file():
+    if not idb_path.is_file() and not alt_idb_path.is_file():
         raise RuntimeError(f"IDA completed but did not create {idb_path}")
     if not result_path.is_file():
         raise RuntimeError(f"IDA completed but did not create {result_path}")
@@ -637,7 +848,7 @@ STAGE_NAMES = {
 }
 
 
-def _handle_ida_line(index: int, line: str, q) -> None:
+def _handle_ida_line(index: int, line: str, q, seen_events: Optional[set] = None) -> None:
     trimmed = line.rstrip("\r\n")
     if not trimmed:
         return
@@ -654,6 +865,12 @@ def _handle_ida_line(index: int, line: str, q) -> None:
     except json.JSONDecodeError:
         return
     if isinstance(payload, dict):
+        if seen_events is not None:
+            seq = payload.get("_seq")
+            event_key = seq if seq is not None else hash(trimmed)
+            if event_key in seen_events:
+                return
+            seen_events.add(event_key)
         kind = payload.get("kind") if isinstance(payload.get("kind"), str) else "log"
         message = payload.get("message") if isinstance(payload.get("message"), str) else ""
         level = payload.get("level") if isinstance(payload.get("level"), str) else None
@@ -680,8 +897,35 @@ def _handle_ida_line(index: int, line: str, q) -> None:
                 provider_from=payload.get("provider_from"),
                 provider_to=payload.get("provider_to"),
             )
+        if kind in ("rename_function", "rename_variable"):
+            item_payload = dict(payload)
+            item_payload.pop("kind", None)
+            item_payload["index"] = index
+            _post(q, kind, **item_payload)
         if kind in ("progress", "stage"):
             _post(q, "sample_status", index=index, status=message)
+        is_err = level in ("error", "err", "fail") or kind in ("error", "fail")
+        is_warn = level in ("warning", "warn")
+        if not is_err and not is_warn and message:
+            low_msg = message.lower()
+            if low_msg.startswith("[-] error") or low_msg.startswith("error:") or "api error:" in low_msg or "rate limit reached" in low_msg:
+                is_err = True
+            elif low_msg.startswith("[-] warning") or low_msg.startswith("warning:"):
+                is_warn = True
+
+        if is_err or is_warn:
+            sev = "Warning" if is_warn else "Error"
+            _post(
+                q,
+                "error_event",
+                time=time.strftime("%H:%M:%S"),
+                severity=sev,
+                stage=STAGE_NAMES.get(stage, stage or "IDA Engine"),
+                sample="",
+                message=message or payload.get("details", "") or "Unknown error",
+                details=payload.get("details") or payload.get("traceback") or "",
+                index=index,
+            )
         if message:
             _post(q, "log", message=message)
 
@@ -789,8 +1033,9 @@ def start_test_connection(genesect_root: Path | str, payload: dict, q, ida_path:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=90,
             )
-        except OSError as error:
+        except (OSError, subprocess.TimeoutExpired) as error:
             _post(q, "test_connection_result", ok=False, message=f"Could not probe connection: {error}", resolved_model=None, target=target)
             return
         parsed = None
@@ -824,8 +1069,25 @@ def open_cli_sign_in(executable: str, extra_args: tuple[str, ...] = ()) -> None:
     if sys.platform == "win32":
         subprocess.Popen(["cmd.exe", "/K", exe, *extra_args], creationflags=subprocess.CREATE_NEW_CONSOLE)
         return
+    if sys.platform == "darwin":
+        # macOS Terminal.app launch via AppleScript
+        full_cmd = " ".join([exe, *extra_args])
+        script = f'tell application "Terminal" to do script "{full_cmd}"'
+        try:
+            subprocess.Popen(["osascript", "-e", script])
+            return
+        except OSError:
+            pass
     cmd = " ".join([exe, *extra_args])
-    for terminal in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["xterm", "-e"]):
+    for terminal in (
+        ["x-terminal-emulator", "-e"],
+        ["gnome-terminal", "--"],
+        ["konsole", "-e"],
+        ["xfce4-terminal", "-e"],
+        ["alacritty", "-e"],
+        ["kitty", "-e"],
+        ["xterm", "-e"],
+    ):
         try:
             subprocess.Popen([*terminal, "bash", "-lc", f"{cmd}; exec bash"])
             return
@@ -836,13 +1098,18 @@ def open_cli_sign_in(executable: str, extra_args: tuple[str, ...] = ()) -> None:
 
 def get_opencode_auth_status() -> Optional[list[str]]:
     candidates: list[Path] = []
-    home = os.environ.get("USERPROFILE") or os.environ.get("HOME")
-    if home:
-        candidates.append(Path(home) / ".local" / "share" / "opencode" / "auth.json")
-        candidates.append(Path(home) / ".config" / "opencode" / "auth.json")
-    for var in ("LOCALAPPDATA", "APPDATA"):
-        if os.environ.get(var):
-            candidates.append(Path(os.environ[var]) / "opencode" / "auth.json")
+    try:
+        home = Path.home()
+        candidates.append(home / ".local" / "share" / "opencode" / "auth.json")
+        candidates.append(home / ".config" / "opencode" / "auth.json")
+        if sys.platform == "darwin":
+            candidates.append(home / "Library" / "Application Support" / "opencode" / "auth.json")
+    except Exception:
+        pass
+    for var in ("LOCALAPPDATA", "APPDATA", "XDG_DATA_HOME", "XDG_CONFIG_HOME"):
+        val = os.environ.get(var)
+        if val:
+            candidates.append(Path(val) / "opencode" / "auth.json")
     for path in candidates:
         if path.is_file():
             try:

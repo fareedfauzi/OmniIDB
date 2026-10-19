@@ -106,11 +106,13 @@ def _compile(names: Iterable[str], prefixes: Iterable[str] = ()) -> "re.Pattern[
 _CAPABILITY_PATTERNS = {
     "network": _compile(
         ["socket", "connect", "send", "recv", "sendto", "recvfrom", "bind", "listen", "accept",
-         "closesocket", "getaddrinfo", "gethostname", "select", "setsockopt", "ioctlsocket",
+         "closesocket", "getaddrinfo", "getnameinfo", "gethostname", "select", "setsockopt", "ioctlsocket",
          "getsockname", "shutdown", "dnsquery", "urldownloadtofile", "urldownloadtocachefile",
          "internetopen", "internetopenurl", "internetconnect", "internetreadfile",
          "internetwritefile", "internetclosehandle", "httpopenrequest", "httpsendrequest",
-         "httpqueryinfo", "ftpputfile", "ftpgetfile", "ftpopen"],
+         "httpqueryinfo", "ftpputfile", "ftpgetfile", "ftpopen", "recvmsg", "sendmsg",
+         "epoll_create", "epoll_ctl", "epoll_wait", "kqueue", "kevent", "pcap_open_live",
+         "res_query", "inet_ntop", "inet_pton"],
         [r"wsa\w+", r"gethostby\w+", r"inet_\w+", r"winhttp\w+", r"curl_\w+", r"dns\w+query\w*",
          r"internet\w+", r"http\w*request\w*", r"wininet\w*", r"urlmon\w*"],
     ),
@@ -119,7 +121,9 @@ _CAPABILITY_PATTERNS = {
          "cryptderivekey", "cryptencrypt", "cryptdecrypt", "cryptgenkey", "cryptimportkey",
          "cryptexportkey", "cryptgenrandom", "cryptdestroykey", "cryptdestroyhash",
          "cryptstringtobinary", "cryptbinarytostring", "cryptprotectdata",
-         "rtlgenrandom", "systemfunction032", "systemfunction033"],
+         "rtlgenrandom", "systemfunction032", "systemfunction033",
+         "cc_sha256_init", "cccrypt", "cccryptorcreate", "seckeyencrypt", "seckeydecrypt",
+         "secitemcopymatching", "crypto_secretbox", "crypto_box"],
         [r"bcrypt\w+", r"ncrypt\w+", r"evp_\w+", r"aes_\w+", r"rsa_\w+", r"sha\d*_\w+",
          r"md5_\w+", r"rc4\w*", r"crypt\w+"],
     ),
@@ -135,23 +139,29 @@ _CAPABILITY_PATTERNS = {
          "zwopenprocess", "suspendthread", "resumethread", "ntresumethread", "zwresumethread",
          "createprocessinternal", "createprocessinternalw", "createprocessinternala",
          "ntcreatesection", "zwcreatesection", "ntcreateuserprocess", "zwcreateuserprocess",
-         "ntcreatetransaction"],
-        [r"nt.*thread\w*", r"zw.*thread\w*", r"nt.*section\w*", r"zw.*section\w*"],
+         "ntcreatetransaction", "ptrace", "process_vm_readv", "process_vm_writev", "memfd_create",
+         "task_for_pid", "mach_vm_write", "mach_vm_read", "mach_vm_allocate", "mach_vm_protect",
+         "thread_create_running", "task_threads", "thread_set_state", "thread_get_state",
+         "task_get_special_port", "posix_spawn", "posix_spawnp"],
+        [r"nt.*thread\w*", r"zw.*thread\w*", r"nt.*section\w*", r"zw.*section\w*", r"mach_vm_\w+"],
     ),
     "anti_debug": _compile(
         ["isdebuggerpresent", "checkremotedebuggerpresent", "ntqueryinformationprocess",
          "zwqueryinformationprocess", "ntsetinformationthread", "zwsetinformationthread",
          "debugactiveprocess", "outputdebugstring", "ntquerysysteminformation",
-         "zwquerysysteminformation", "blockinput", "ntdelayexecution", "zwdelayexecution"],
+         "zwquerysysteminformation", "blockinput", "ntdelayexecution", "zwdelayexecution",
+         "ptrace", "sysctl", "sysctlbyname", "proc_pidinfo", "ami_being_debugged"],
     ),
     "dynamic_resolve": _compile(
         ["getprocaddress", "ldrgetprocedureaddress", "loadlibrary", "loadlibraryex",
-         "ldrloaddll", "getmodulehandle", "getmodulehandleex", "dlsym", "dlopen", "freelibrary"],
+         "ldrloaddll", "getmodulehandle", "getmodulehandleex", "dlsym", "dlopen", "freelibrary",
+         "dlclose", "dlinfo"],
     ),
     "memory": _compile(
         ["virtualalloc", "virtualalloc2", "virtualprotect", "virtualprotectex",
          "virtualprotectfromapp", "virtualfree", "ntfreevirtualmemory", "zwfreevirtualmemory",
-         "heapcreate", "heapalloc", "mmap", "mprotect"],
+         "heapcreate", "heapalloc", "mmap", "mprotect", "munmap", "posix_memalign",
+         "mach_vm_allocate", "vm_allocate"],
     ),
     "resource": _compile(
         ["findresource", "findresourceex", "loadresource", "lockresource", "sizeofresource"],
@@ -160,12 +170,15 @@ _CAPABILITY_PATTERNS = {
     "stealer": _compile(
         ["cryptunprotectdata", "openclipboard", "getclipboarddata", "getasynckeystate",
          "getkeystate", "getkeyboardstate", "setwindowshook", "bitblt", "getdibits",
-         "getdc", "vaultcli", "vaultgetinformation", "pstorecreateinstance"],
+         "getdc", "vaultcli", "vaultgetinformation", "pstorecreateinstance",
+         "seckeychainsearchcopynext", "secitemcopymatching", "seckeychaincopydefault",
+         "getspnam", "getpwnam", "pam_authenticate"],
     ),
     "persistence": _compile(
         ["openscmanager", "createservice", "startservice", "controlservice", "deleteservice",
          "openservice", "changeserviceconfig", "startservicectrldispatcher",
-         "registerservicectrlhandler", "queryserviceconfig"],
+         "registerservicectrlhandler", "queryserviceconfig", "systemctl", "launchctl", "crontab",
+         "init_module", "finit_module", "delete_module", "kextload", "kextunload"],
         [r"schtasks\w*"],
     ),
     "discovery": _compile(
@@ -174,7 +187,8 @@ _CAPABILITY_PATTERNS = {
          "getsystemdirectory", "getwindowsdirectory", "getvolumeinformation",
          "globalmemorystatus", "globalmemorystatusex", "getlogicaldrives", "uname",
          "getdisktype", "netshareenum", "netserverenum", "netuserenum", "netlocalgroupenum",
-         "wnetopenenum", "netgetjoininformation"],
+         "wnetopenenum", "netgetjoininformation", "gethostid", "getdomainname",
+         "getifaddrs", "getlogin", "getpwuid", "statfs", "fstatfs", "statvfs"],
     ),
     "lateral": _compile(
         ["createnamedpipe", "connectnamedpipe", "callnamedpipe", "transactnamedpipe",
@@ -189,7 +203,9 @@ _CAPABILITY_PATTERNS = {
          "lzmadecode", "lzmaencode", "rtlcompressbuffer", "rtldecompressbuffer"],
     ),
     "driver": _compile(
-        ["deviceiocontrol", "zwloaddriver", "ntloaddriver", "zwunloaddriver", "ntunloaddriver"],
+        ["deviceiocontrol", "zwloaddriver", "ntloaddriver", "zwunloaddriver", "ntunloaddriver",
+         "ioctl", "init_module", "finit_module", "delete_module", "kextload", "kextunload",
+         "ioserviceopen", "ioconnectcallmethod", "ioconnectcallscalarmethod"],
     ),
     "gui": _compile(
         ["createwindow", "createwindowex", "registerclass", "registerclassex", "getmessage",
@@ -202,7 +218,9 @@ _CAPABILITY_PATTERNS = {
          "findfirstfile", "findnextfile", "gettemppath", "gettempfilename", "createdirectory",
          "removedirectory", "setfileattributes", "getfileattributes", "ntcreatefile",
          "fopen", "fread", "fwrite", "unlink", "getfilesize", "setfilepointer",
-         "createfilemapping", "mapviewoffile", "shfileoperation"],
+         "createfilemapping", "mapviewoffile", "shfileoperation",
+         "open", "creat", "read", "write", "close", "stat", "lstat", "fstat",
+         "chmod", "fchmod", "chown", "fchown", "mknod", "symlink", "readlink"],
     ),
     "registry": _compile(
         ["ntopenkey", "ntsetvaluekey", "ntcreatekey", "shgetvalue", "shsetvalue", "shdeletekey",
@@ -211,18 +229,19 @@ _CAPABILITY_PATTERNS = {
     ),
     "process": _compile(
         ["createprocess", "createprocessasuser", "createprocesswithlogon", "winexec",
-         "shellexecute", "system", "popen", "execve", "execl", "fork", "terminateprocess",
-         "createtoolhelp32snapshot", "process32first", "process32next", "thread32first",
-         "thread32next", "enumprocesses", "enumprocessmodules", "openprocesstoken",
-         "adjusttokenprivileges", "lookupprivilegevalue", "impersonateloggedonuser",
-         "duplicatetoken", "duplicatehandle", "ntduplicateobject", "createmutex", "openmutex"],
+         "shellexecute", "system", "popen", "execve", "execl", "fork", "vfork", "execvp",
+         "execv", "terminateprocess", "createtoolhelp32snapshot", "process32first",
+         "process32next", "thread32first", "thread32next", "enumprocesses", "enumprocessmodules",
+         "openprocesstoken", "adjusttokenprivileges", "lookupprivilegevalue",
+         "impersonateloggedonuser", "duplicatetoken", "duplicatehandle", "ntduplicateobject",
+         "createmutex", "openmutex", "posix_spawn", "waitpid", "sigaction", "pipe", "dup2"],
     ),
     "system_info": _compile(
         ["getcomputername", "getusername", "getsysteminfo", "getnativesysteminfo",
          "getversion", "rtlgetversion", "getadaptersinfo", "getadaptersaddresses",
          "getsystemdirectory", "getwindowsdirectory", "getvolumeinformation",
          "globalmemorystatus", "globalmemorystatusex", "getlogicaldrives", "uname",
-         "getdisktype", "getcurrentdirectory"],
+         "getdisktype", "getcurrentdirectory", "sysctl", "sysctlbyname"],
     ),
     "input_capture": _compile(
         ["getasynckeystate", "getkeystate", "getkeyboardstate", "getclipboarddata",
@@ -292,11 +311,14 @@ _REGISTRY_RE = re.compile(
     r"(?:HKEY_[A-Z_]+|\bHK(?:LM|CU|CR|U)\b)\\?|\\CurrentVersion\\Run|\\CurrentControlSet\\|^Software\\Microsoft\\",
     re.I,
 )
-_PATH_RE = re.compile(r"(?:\b[A-Za-z]:\\|%[A-Za-z_]+%\\?|\\\\[\w.$-]+\\|(?:^|\s)/(?:etc|tmp|var|usr|bin|home)/)")
+_PATH_RE = re.compile(
+    r"(?:\b[A-Za-z]:\\|%[A-Za-z_]+%\\?|\\\\[\w.$-]+\\|(?:^|\s)/(?:etc|tmp|var|usr|bin|home|Library|Applications|System|dev|proc|sys)/)"
+)
 _COMMAND_RE = re.compile(
     r"\bcmd(?:\.exe)?\s*/[ck]\b|\bpowershell(?:\.exe)?\b|\bpwsh\b|\bwscript\b|\bcscript\b|\bmshta\b|"
     r"\brundll32\b|\bregsvr32\b|\bcertutil\b|\bbitsadmin\b|\bschtasks\b|\bwmic\b|"
-    r"-enc(?:odedcommand)?\b|/bin/(?:ba)?sh\b",
+    r"-enc(?:odedcommand)?\b|/bin/(?:ba)?sh\b|\blaunchctl\b|\bsystemctl\b|\bcrontab\b|"
+    r"\biptables\b|\bufw\b|\bosascript\b|\bcurl\s+-[fsSLkO]|\bwget\s+|\b(?:nc|ncat|netcat|socat)\b",
     re.I,
 )
 _USERAGENT_RE = re.compile(r"Mozilla/\d|User-Agent:|\bcurl/\d|\bWinHTTP\b", re.I)
@@ -305,11 +327,16 @@ _B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+
 _PIPE_RE = re.compile(r"\\\\(?:\.|\w+)\\pipe\\[\w.$-]+", re.I)
 _DEVICE_RE = re.compile(r"\\\\(?:\.|\?)\\(?:PhysicalDrive\d+|Volume\{[0-9a-f-]+\}|[A-Za-z]:|[\w._-]+)", re.I)
 _STEALER_TARGET_RE = re.compile(
-    r"\b(?:Login Data|Web Data|cookies\.sqlite|key4\.db|logins\.json|wallet\.dat|Discord[\\/]Tokens|Telegram Desktop|Foxmail)\b",
+    r"\b(?:Login Data|Web Data|cookies\.sqlite|key4\.db|logins\.json|wallet\.dat|Discord[\\/]Tokens|Telegram Desktop|Foxmail)\b|"
+    r"(?:\.ssh/(?:id_rsa|id_ed25519|known_hosts)|\.aws/credentials|/etc/(?:shadow|passwd)|login\.keychain(?:-db)?|"
+    r"\.config/(?:google-chrome|chromium)/|\.mozilla/firefox/)",
     re.I,
 )
 _PERSIST_RE = re.compile(
-    r"\\CurrentVersion\\(?:Run|RunOnce|Winlogon|Explorer\\Shell Folders)|\\Startup\\|schtasks(?:\.exe)?\s*/create",
+    r"\\CurrentVersion\\(?:Run|RunOnce|Winlogon|Explorer\\Shell Folders)|\\Startup\\|schtasks(?:\.exe)?\s*/create|"
+    r"/(?:etc|lib)/systemd/system/|/(?:Library|System/Library)/Launch(?:Agents|Daemons)/|"
+    r"~/Library/LaunchAgents/|launchctl\s+(?:load|bootstrap|submit)|/etc/cron\.|/var/spool/cron|"
+    r"/etc/init\.d/|/etc/rc\.local",
     re.I,
 )
 

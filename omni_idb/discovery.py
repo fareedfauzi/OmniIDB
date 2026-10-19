@@ -69,6 +69,9 @@ class Sample:
     def is_failed(self) -> bool:
         return self.status == "Failed"
 
+    def is_stopped(self) -> bool:
+        return self.status.startswith("Stopped")
+
     def is_skipped(self) -> bool:
         return self.status.startswith("Skipped")
 
@@ -208,7 +211,22 @@ _MACHO_MAGICS = {
 
 
 def _valid_macho(data: bytes) -> bool:
-    return len(data) >= 28 and data[:4] in _MACHO_MAGICS
+    if len(data) < 28 or data[:4] not in _MACHO_MAGICS:
+        return False
+    # If fat binary magic (cafebabe/bebafeca), verify it's not a Java .class file.
+    # Java class files also start with cafebabe, followed by minor_version (u16) and major_version (u16 >= 45).
+    # Mach-O fat headers have nfat_arch (1..32) and cputype at offset 8.
+    if data[:4] in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+        endian = "big" if data[:4] == b"\xca\xfe\xba\xbe" else "little"
+        nfat = int.from_bytes(data[4:8], endian)
+        if not (1 <= nfat <= 32):
+            return False
+        cputype = int.from_bytes(data[8:12], endian)
+        base_cpu = cputype & 0x00FFFFFF
+        # Mach-O CPU types: VAX=1, MC680x0=6, I386=7, MIPS=8, HPPA=11, ARM=12, POWERPC=18
+        if base_cpu not in (1, 6, 7, 8, 11, 12, 18):
+            return False
+    return True
 
 
 def _looks_like_text(data: bytes) -> bool:

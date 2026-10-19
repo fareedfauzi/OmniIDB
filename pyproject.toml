@@ -15,3 +15,6 @@ omni-idb = "omni_idb.app:run"
 
 [tool.setuptools]
 packages = ["omni_idb"]
+
+[tool.setuptools.package-data]
+omni_idb = ["templates/*"]

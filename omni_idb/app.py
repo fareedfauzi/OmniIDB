@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -36,7 +37,7 @@ from .config import (
     runner_script,
 )
 from .discovery import Sample, SampleKind, discover, format_size
-from .runner import OmniEvent, GenesectEvent, RunnerEvent, RunRequest
+from .runner import OmniEvent, GenesectEvent, RunnerEvent, RunRequest, sample_output_folder
 
 # ---------------------------------------------------------------- palette
 # Dark modern slate-navy aesthetic matching the designer UI
@@ -118,7 +119,19 @@ def _detect_font_family(root: Optional[tk.Tk] = None) -> str:
     try:
         import tkinter.font as tkfont
         available = set(tkfont.families(root))
-        for cand in ("JetBrains Mono", "Cascadia Code", "Cascadia Mono", "Consolas", "Courier New"):
+        for cand in (
+            "JetBrains Mono",
+            "Cascadia Code",
+            "Cascadia Mono",
+            "SF Mono",
+            "Menlo",
+            "Monaco",
+            "DejaVu Sans Mono",
+            "Ubuntu Mono",
+            "Liberation Mono",
+            "Consolas",
+            "Courier New",
+        ):
             if cand in available:
                 return cand
     except Exception:
@@ -547,23 +560,27 @@ class QueueView(tk.Frame):
         master,
         compact: bool = False,
         on_open_output: Optional[Callable[[str], None]] = None,
+        on_delete_output: Optional[Callable[[str], None]] = None,
         on_open_report: Optional[Callable[[str, str], None]] = None,
         on_open_location: Optional[Callable[[str], None]] = None,
         on_copy_path: Optional[Callable[[str], None]] = None,
         on_copy_md5: Optional[Callable[[str], None]] = None,
         on_remove_sample: Optional[Callable[[str], None]] = None,
         on_sort: Optional[Callable[[str], None]] = None,
+        on_select: Optional[Callable[[str], None]] = None,
         is_running_fn: Optional[Callable[[], bool]] = None,
     ):
         super().__init__(master, bg=CONSOLE_BG)
         self.compact = compact
         self.on_open_output = on_open_output
+        self.on_delete_output = on_delete_output
         self.on_open_report = on_open_report
         self.on_open_location = on_open_location
         self.on_copy_path = on_copy_path
         self.on_copy_md5 = on_copy_md5
         self.on_remove_sample = on_remove_sample
         self.on_sort = on_sort
+        self.on_select = on_select
         self.is_running_fn = is_running_fn
         self.spinner_index = 0
         self.columnconfigure(0, weight=1)
@@ -596,15 +613,31 @@ class QueueView(tk.Frame):
         }.items():
             self.tree.tag_configure(tag, background=bg, foreground=fg)
 
+        # Vertical divider lines between columns
+        self.seps: list[tk.Frame] = []
+        for _ in cols[:-1]:
+            sep = tk.Frame(self.tree, width=1, bg="#2D3B4F")
+            sep.bind("<Button-1>", self._on_sep_click)
+            sep.bind("<Double-1>", self._on_sep_double_click)
+            sep.bind("<Button-3>", self._on_sep_right_click)
+            self.seps.append(sep)
+
         yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview, style="Vertical.TScrollbar")
-        xscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview, style="Horizontal.TScrollbar")
-        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.xscroll = ttk.Scrollbar(self, orient="horizontal", command=self._on_xscroll_cmd, style="Horizontal.TScrollbar")
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=self._on_xscroll_set)
 
         self.tree.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
+        self.xscroll.grid(row=1, column=0, sticky="ew")
+
+        # Responsive divider lines tracking
+        self.tree.bind("<Configure>", lambda e: self._update_column_separators(), add="+")
+        self.tree.bind("<B1-Motion>", lambda e: self._update_column_separators(), add="+")
+        self.tree.bind("<ButtonRelease-1>", lambda e: self.after_idle(self._update_column_separators), add="+")
+        self.after(50, self._update_column_separators)
 
         # Double-click and keyboard shortcuts
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Return>", self._on_double_click)
         self.tree.bind("<Delete>", self._on_delete_key)
@@ -614,6 +647,8 @@ class QueueView(tk.Frame):
         # Right-click context menu
         self.context_menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=BLUE, activeforeground="#FFFFFF", font=UI_FONT)
         self.context_menu.add_command(label="Open Output Folder", command=self._open_selected_folder)
+        self.context_menu.add_command(label="Delete Output Folder", command=self._delete_selected_folder)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="Open HTML Report", command=self._open_selected_report_html)
         self.context_menu.add_command(label="Open PDF Report", command=self._open_selected_report_pdf)
         self.context_menu.add_command(label="Open File Location", command=self._open_selected_location)
@@ -638,6 +673,58 @@ class QueueView(tk.Frame):
             justify="center",
         )
         self.empty_label.pack()
+
+    def _on_xscroll_cmd(self, *args) -> None:
+        self.tree.xview(*args)
+        self._update_column_separators()
+
+    def _on_xscroll_set(self, first, last) -> None:
+        self.xscroll.set(first, last)
+        self._update_column_separators()
+
+    def _on_sep_click(self, event) -> None:
+        y_in_tree = event.y + 26
+        row_id = self.tree.identify_row(y_in_tree)
+        if row_id:
+            self.tree.selection_set(row_id)
+            self.tree.focus(row_id)
+
+    def _on_sep_double_click(self, event) -> None:
+        self._on_sep_click(event)
+        self._on_double_click(event)
+
+    def _on_sep_right_click(self, event) -> None:
+        y_in_tree = event.y + 26
+        row_id = self.tree.identify_row(y_in_tree)
+        if row_id:
+            self.tree.selection_set(row_id)
+            self.tree.focus(row_id)
+            self._on_right_click(event)
+
+    def _update_column_separators(self, event=None) -> None:
+        if not hasattr(self, "seps") or not self.seps:
+            return
+        cols = self.tree["columns"]
+        if not cols:
+            return
+        try:
+            total_w = sum(self.tree.column(c, "width") for c in cols)
+            xview = self.tree.xview()
+            scroll_offset = int(round(xview[0] * total_w)) if xview and total_w else 0
+        except Exception:
+            scroll_offset = 0
+
+        heading_h = 26
+        cur_x = -scroll_offset
+        tree_w = self.tree.winfo_width()
+        for idx, col in enumerate(cols[:-1]):
+            if idx >= len(self.seps):
+                break
+            cur_x += self.tree.column(col, "width")
+            if cur_x < 0 or (tree_w > 1 and cur_x > tree_w):
+                self.seps[idx].place_forget()
+            else:
+                self.seps[idx].place(x=cur_x, y=heading_h, relheight=1.0, height=-heading_h)
 
     def _on_heading_click(self, col: str) -> None:
         if self.on_sort:
@@ -675,12 +762,21 @@ class QueueView(tk.Frame):
                 self.context_menu.entryconfigure("Remove from Queue", state=remove_state)
             except Exception:
                 pass
+            try:
+                self.context_menu.entryconfigure("Delete Output Folder", state=remove_state)
+            except Exception:
+                pass
             self.context_menu.post(event.x_root, event.y_root)
 
     def _open_selected_folder(self) -> None:
         sel = self.tree.selection()
         if sel and self.on_open_output:
             self.on_open_output(sel[0])
+
+    def _delete_selected_folder(self) -> None:
+        sel = self.tree.selection()
+        if sel and self.on_delete_output:
+            self.on_delete_output(sel[0])
 
     def _open_selected_report_html(self) -> None:
         sel = self.tree.selection()
@@ -717,6 +813,11 @@ class QueueView(tk.Frame):
 
     def _on_copy_path_key(self, event=None) -> None:
         self._copy_selected_path()
+
+    def _on_tree_select(self, event=None) -> None:
+        sel = self.tree.selection()
+        if sel and self.on_select:
+            self.on_select(sel[0])
 
     @staticmethod
     def _draw_empty_icon(canvas: tk.Canvas) -> None:
@@ -804,6 +905,923 @@ class QueueView(tk.Frame):
                 except Exception:
                     pass
 
+        self.after_idle(self._update_column_separators)
+
+
+class FunctionTableView(tk.Frame):
+    """Interactive function rename table matching Genesect's VirtualFuncModel."""
+
+    COLS = ("n", "address", "old", "new", "score", "subs", "status")
+
+    def __init__(self, master, on_copy: Optional[Callable[[str], None]] = None):
+        super().__init__(master, bg=CONSOLE_BG)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.on_copy = on_copy
+        self.items: list[dict] = []
+        self.filter_text = ""
+        self.sort_col = "address"
+        self.sort_desc = False
+
+        self.tree = ttk.Treeview(self, columns=self.COLS, show="headings", selectmode="extended", style="Omni.Treeview")
+        self.orig_heads = {
+            "n": ("#", 45, 36),
+            "address": ("Address", 120, 90),
+            "old": ("Current Name", 220, 130),
+            "new": ("AI Suggestion", 280, 160),
+            "score": ("Score", 80, 60),
+            "subs": ("sub_* Count", 95, 70),
+            "status": ("Status", 130, 90),
+        }
+        for col in self.COLS:
+            title, width, minw = self.orig_heads[col]
+            self.tree.heading(col, text=title, command=lambda c=col: self._on_heading_click(c))
+            self.tree.column(col, width=width, minwidth=minw, anchor="w", stretch=(col == "new"))
+
+        self.tree.tag_configure("ok", background=STATUS_COLORS["Complete"][0], foreground=STATUS_COLORS["Complete"][1])
+        self.tree.tag_configure("cached", background="#121F33", foreground="#60A5FA")
+        self.tree.tag_configure("fail", background=STATUS_COLORS["Failed"][0], foreground=STATUS_COLORS["Failed"][1])
+        self.tree.tag_configure("warn", background=AMBER_BG, foreground=AMBER)
+
+        # Vertical divider lines between columns
+        self.seps: list[tk.Frame] = []
+        for _ in self.COLS[:-1]:
+            sep = tk.Frame(self.tree, width=1, bg="#2D3B4F")
+            self.seps.append(sep)
+
+        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview, style="Vertical.TScrollbar")
+        self.xscroll = ttk.Scrollbar(self, orient="horizontal", command=self._on_xscroll_cmd, style="Horizontal.TScrollbar")
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=self._on_xscroll_set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        self.xscroll.grid(row=1, column=0, sticky="ew")
+
+        # Responsive divider lines tracking
+        self.tree.bind("<Configure>", lambda e: self._update_column_separators(), add="+")
+        self.tree.bind("<B1-Motion>", lambda e: self._update_column_separators(), add="+")
+        self.tree.bind("<ButtonRelease-1>", lambda e: self.after_idle(self._update_column_separators), add="+")
+
+        # Context Menu
+        self.context_menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=BLUE, activeforeground="#FFFFFF", font=UI_FONT)
+        self.context_menu.add_command(label="Copy Address", command=self._copy_address)
+        self.context_menu.add_command(label="Copy Current Name", command=self._copy_old_name)
+        self.context_menu.add_command(label="Copy AI Suggestion", command=self._copy_new_name)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Copy Selected Row(s)", command=self._copy_selected_rows)
+        self.tree.bind("<Button-3>", self._on_right_click)
+
+        # Empty State
+        self.empty_frame = tk.Frame(self, bg=CONSOLE_BG)
+        self.empty_label = tk.Label(
+            self.empty_frame,
+            text="No function renames recorded yet.\nRun OmniIDB on a sample to populate function renaming table.",
+            bg=CONSOLE_BG,
+            fg=DIM,
+            font=UI_FONT,
+            justify="center",
+        )
+        self.empty_label.pack()
+        self.refresh()
+
+    def _on_xscroll_cmd(self, *args) -> None:
+        self.tree.xview(*args)
+        self._update_column_separators()
+
+    def _on_xscroll_set(self, first, last) -> None:
+        self.xscroll.set(first, last)
+        self._update_column_separators()
+
+    def _update_column_separators(self, event=None) -> None:
+        if not hasattr(self, "seps") or not self.seps:
+            return
+        cols = self.tree["columns"]
+        if not cols:
+            return
+        try:
+            total_w = sum(self.tree.column(c, "width") for c in cols)
+            xview = self.tree.xview()
+            scroll_offset = int(round(xview[0] * total_w)) if xview and total_w else 0
+        except Exception:
+            scroll_offset = 0
+
+        heading_h = 26
+        cur_x = -scroll_offset
+        tree_w = self.tree.winfo_width()
+        for idx, col in enumerate(cols[:-1]):
+            if idx >= len(self.seps):
+                break
+            cur_x += self.tree.column(col, "width")
+            if cur_x < 0 or (tree_w > 1 and cur_x > tree_w):
+                self.seps[idx].place_forget()
+            else:
+                self.seps[idx].place(x=cur_x, y=heading_h, relheight=1.0, height=-heading_h)
+
+    def _on_heading_click(self, col: str) -> None:
+        if self.sort_col == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col = col
+            self.sort_desc = False
+        self._update_headings()
+        self.refresh()
+
+    def _update_headings(self) -> None:
+        for col in self.COLS:
+            title, _, _ = self.orig_heads[col]
+            if col == self.sort_col:
+                arrow = " ▼" if self.sort_desc else " ▲"
+                self.tree.heading(col, text=f"{title}{arrow}")
+            else:
+                self.tree.heading(col, text=title)
+
+    def _on_right_click(self, event) -> None:
+        row_id = self.tree.identify_row(event.y)
+        if row_id:
+            if row_id not in self.tree.selection():
+                self.tree.selection_set(row_id)
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def _get_first_selected_values(self) -> Optional[list]:
+        sel = self.tree.selection()
+        if sel:
+            item = self.tree.item(sel[0])
+            return item.get("values", [])
+        return None
+
+    def _copy_address(self) -> None:
+        vals = self._get_first_selected_values()
+        if vals and len(vals) > 1 and self.on_copy:
+            self.on_copy(str(vals[1]))
+
+    def _copy_old_name(self) -> None:
+        vals = self._get_first_selected_values()
+        if vals and len(vals) > 2 and self.on_copy:
+            self.on_copy(str(vals[2]))
+
+    def _copy_new_name(self) -> None:
+        vals = self._get_first_selected_values()
+        if vals and len(vals) > 3 and self.on_copy:
+            self.on_copy(str(vals[3]))
+
+    def _copy_selected_rows(self) -> None:
+        sel = self.tree.selection()
+        if not sel or not self.on_copy:
+            return
+        lines = []
+        for iid in sel:
+            vals = self.tree.item(iid).get("values", [])
+            lines.append("\t".join(str(v) for v in vals))
+        self.on_copy("\n".join(lines))
+
+    def copy_all(self) -> None:
+        if not self.on_copy:
+            return
+        lines = ["\t".join(self.orig_heads[c][0] for c in self.COLS)]
+        for iid in self.tree.get_children():
+            vals = self.tree.item(iid).get("values", [])
+            lines.append("\t".join(str(v) for v in vals))
+        self.on_copy("\n".join(lines))
+
+    def export_csv(self, filepath: str) -> None:
+        import csv
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([self.orig_heads[c][0] for c in self.COLS])
+            for iid in self.tree.get_children():
+                vals = self.tree.item(iid).get("values", [])
+                writer.writerow(vals)
+
+    def add_item(self, item: dict) -> None:
+        self.items.append(item)
+        if self.filter_text:
+            self.refresh()
+            return
+        if self.sort_col != "address" or self.sort_desc:
+            self.refresh()
+            return
+
+        self.empty_frame.place_forget()
+        idx = len(self.items)
+        status_val = str(item.get("status", "Renamed"))
+        tag = "ok"
+        if "cache" in status_val.lower():
+            tag = "cached"
+        elif "fail" in status_val.lower() or "reject" in status_val.lower():
+            tag = "fail"
+        elif "skip" in status_val.lower():
+            tag = "warn"
+
+        values = (
+            idx,
+            item.get("address", ""),
+            item.get("old", ""),
+            item.get("new", ""),
+            item.get("score", "--"),
+            item.get("subs", "0"),
+            status_val,
+        )
+        self.tree.insert("", "end", values=values, tags=(tag,))
+        self.after_idle(self._update_column_separators)
+
+    def set_items(self, items: list[dict]) -> None:
+        self.items = list(items)
+        self.refresh()
+
+    def clear(self) -> None:
+        self.items.clear()
+        self.refresh()
+
+    def count(self) -> int:
+        return len(self.items)
+
+    def set_filter(self, text: str) -> None:
+        self.filter_text = text.strip().lower()
+        self.refresh()
+
+    def _filtered_items(self) -> list[dict]:
+        ft = self.filter_text
+        if not ft:
+            res = list(self.items)
+        else:
+            res = []
+            for it in self.items:
+                addr = str(it.get("address", "")).lower()
+                old = str(it.get("old", "")).lower()
+                new = str(it.get("new", "")).lower()
+                status = str(it.get("status", "")).lower()
+                if ft in addr or ft in old or ft in new or ft in status:
+                    res.append(it)
+
+        def sort_val(it: dict):
+            val = it.get(self.sort_col, "")
+            if self.sort_col == "address":
+                try:
+                    return int(str(val), 16)
+                except ValueError:
+                    return 0
+            if self.sort_col == "subs":
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    return 0
+            return str(val).lower()
+
+        res.sort(key=sort_val, reverse=self.sort_desc)
+        return res
+
+    def refresh(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        filtered = self._filtered_items()
+        if not self.items:
+            self.empty_label.configure(text="No function renames recorded yet.\nRun OmniIDB on a sample to populate function renaming table.")
+            self.empty_frame.place(relx=0.5, rely=0.45, anchor="center")
+        elif not filtered:
+            self.empty_label.configure(text="No functions match the active filter.")
+            self.empty_frame.place(relx=0.5, rely=0.45, anchor="center")
+        else:
+            self.empty_frame.place_forget()
+            for idx, it in enumerate(filtered, 1):
+                status_val = str(it.get("status", "Renamed"))
+                tag = "ok"
+                if "cache" in status_val.lower():
+                    tag = "cached"
+                elif "fail" in status_val.lower() or "reject" in status_val.lower():
+                    tag = "fail"
+                elif "skip" in status_val.lower():
+                    tag = "warn"
+
+                values = (
+                    idx,
+                    it.get("address", ""),
+                    it.get("old", ""),
+                    it.get("new", ""),
+                    it.get("score", "--"),
+                    it.get("subs", "0"),
+                    status_val,
+                )
+                self.tree.insert("", "end", values=values, tags=(tag,))
+
+        self.after_idle(self._update_column_separators)
+
+
+class VariableTableView(tk.Frame):
+    """Interactive variable rename table matching Genesect's VirtualFuncModel."""
+
+    COLS = ("n", "address", "func_name", "renames", "details", "status")
+
+    def __init__(self, master, on_copy: Optional[Callable[[str], None]] = None):
+        super().__init__(master, bg=CONSOLE_BG)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.on_copy = on_copy
+        self.items: list[dict] = []
+        self.filter_text = ""
+        self.sort_col = "address"
+        self.sort_desc = False
+
+        self.tree = ttk.Treeview(self, columns=self.COLS, show="headings", selectmode="extended", style="Omni.Treeview")
+        self.orig_heads = {
+            "n": ("#", 45, 36),
+            "address": ("Address", 120, 90),
+            "func_name": ("Function Name", 240, 140),
+            "renames": ("Variables Renamed", 140, 100),
+            "details": ("Renamed Variables", 320, 160),
+            "status": ("Status", 120, 80),
+        }
+        for col in self.COLS:
+            title, width, minw = self.orig_heads[col]
+            self.tree.heading(col, text=title, command=lambda c=col: self._on_heading_click(c))
+            self.tree.column(col, width=width, minwidth=minw, anchor="w", stretch=(col == "details"))
+
+        self.tree.tag_configure("ok", background=STATUS_COLORS["Complete"][0], foreground=STATUS_COLORS["Complete"][1])
+        self.tree.tag_configure("fail", background=STATUS_COLORS["Failed"][0], foreground=STATUS_COLORS["Failed"][1])
+        self.tree.tag_configure("warn", background=AMBER_BG, foreground=AMBER)
+
+        # Vertical divider lines between columns
+        self.seps: list[tk.Frame] = []
+        for _ in self.COLS[:-1]:
+            sep = tk.Frame(self.tree, width=1, bg="#2D3B4F")
+            self.seps.append(sep)
+
+        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview, style="Vertical.TScrollbar")
+        self.xscroll = ttk.Scrollbar(self, orient="horizontal", command=self._on_xscroll_cmd, style="Horizontal.TScrollbar")
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=self._on_xscroll_set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        self.xscroll.grid(row=1, column=0, sticky="ew")
+
+        # Responsive divider lines tracking
+        self.tree.bind("<Configure>", lambda e: self._update_column_separators(), add="+")
+        self.tree.bind("<B1-Motion>", lambda e: self._update_column_separators(), add="+")
+        self.tree.bind("<ButtonRelease-1>", lambda e: self.after_idle(self._update_column_separators), add="+")
+
+        # Context Menu
+        self.context_menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=BLUE, activeforeground="#FFFFFF", font=UI_FONT)
+        self.context_menu.add_command(label="Copy Address", command=self._copy_address)
+        self.context_menu.add_command(label="Copy Function Name", command=self._copy_func_name)
+        self.context_menu.add_command(label="Copy Details", command=self._copy_details)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Copy Selected Row(s)", command=self._copy_selected_rows)
+        self.tree.bind("<Button-3>", self._on_right_click)
+
+        # Empty State
+        self.empty_frame = tk.Frame(self, bg=CONSOLE_BG)
+        self.empty_label = tk.Label(
+            self.empty_frame,
+            text="No variable renames recorded yet.\nRun OmniIDB on a sample with 'Rename local variables' enabled.",
+            bg=CONSOLE_BG,
+            fg=DIM,
+            font=UI_FONT,
+            justify="center",
+        )
+        self.empty_label.pack()
+        self.refresh()
+
+    def _on_xscroll_cmd(self, *args) -> None:
+        self.tree.xview(*args)
+        self._update_column_separators()
+
+    def _on_xscroll_set(self, first, last) -> None:
+        self.xscroll.set(first, last)
+        self._update_column_separators()
+
+    def _update_column_separators(self, event=None) -> None:
+        if not hasattr(self, "seps") or not self.seps:
+            return
+        cols = self.tree["columns"]
+        if not cols:
+            return
+        try:
+            total_w = sum(self.tree.column(c, "width") for c in cols)
+            xview = self.tree.xview()
+            scroll_offset = int(round(xview[0] * total_w)) if xview and total_w else 0
+        except Exception:
+            scroll_offset = 0
+
+        heading_h = 26
+        cur_x = -scroll_offset
+        tree_w = self.tree.winfo_width()
+        for idx, col in enumerate(cols[:-1]):
+            if idx >= len(self.seps):
+                break
+            cur_x += self.tree.column(col, "width")
+            if cur_x < 0 or (tree_w > 1 and cur_x > tree_w):
+                self.seps[idx].place_forget()
+            else:
+                self.seps[idx].place(x=cur_x, y=heading_h, relheight=1.0, height=-heading_h)
+
+    def _on_heading_click(self, col: str) -> None:
+        if self.sort_col == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col = col
+            self.sort_desc = False
+        self._update_headings()
+        self.refresh()
+
+    def _update_headings(self) -> None:
+        for col in self.COLS:
+            title, _, _ = self.orig_heads[col]
+            if col == self.sort_col:
+                arrow = " ▼" if self.sort_desc else " ▲"
+                self.tree.heading(col, text=f"{title}{arrow}")
+            else:
+                self.tree.heading(col, text=title)
+
+    def _on_right_click(self, event) -> None:
+        row_id = self.tree.identify_row(event.y)
+        if row_id:
+            if row_id not in self.tree.selection():
+                self.tree.selection_set(row_id)
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def _get_first_selected_values(self) -> Optional[list]:
+        sel = self.tree.selection()
+        if sel:
+            item = self.tree.item(sel[0])
+            return item.get("values", [])
+        return None
+
+    def _copy_address(self) -> None:
+        vals = self._get_first_selected_values()
+        if vals and len(vals) > 1 and self.on_copy:
+            self.on_copy(str(vals[1]))
+
+    def _copy_func_name(self) -> None:
+        vals = self._get_first_selected_values()
+        if vals and len(vals) > 2 and self.on_copy:
+            self.on_copy(str(vals[2]))
+
+    def _copy_details(self) -> None:
+        vals = self._get_first_selected_values()
+        if vals and len(vals) > 4 and self.on_copy:
+            self.on_copy(str(vals[4]))
+
+    def _copy_selected_rows(self) -> None:
+        sel = self.tree.selection()
+        if not sel or not self.on_copy:
+            return
+        lines = []
+        for iid in sel:
+            vals = self.tree.item(iid).get("values", [])
+            lines.append("\t".join(str(v) for v in vals))
+        self.on_copy("\n".join(lines))
+
+    def copy_all(self) -> None:
+        if not self.on_copy:
+            return
+        lines = ["\t".join(self.orig_heads[c][0] for c in self.COLS)]
+        for iid in self.tree.get_children():
+            vals = self.tree.item(iid).get("values", [])
+            lines.append("\t".join(str(v) for v in vals))
+        self.on_copy("\n".join(lines))
+
+    def export_csv(self, filepath: str) -> None:
+        import csv
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([self.orig_heads[c][0] for c in self.COLS])
+            for iid in self.tree.get_children():
+                vals = self.tree.item(iid).get("values", [])
+                writer.writerow(vals)
+
+    def add_item(self, item: dict) -> None:
+        self.items.append(item)
+        if self.filter_text:
+            self.refresh()
+            return
+        if self.sort_col != "address" or self.sort_desc:
+            self.refresh()
+            return
+
+        self.empty_frame.place_forget()
+        idx = len(self.items)
+        status_val = str(item.get("status", "Complete"))
+        tag = "ok"
+        if "no changes" in status_val.lower() or "reject" in status_val.lower() or "fail" in status_val.lower():
+            tag = "warn"
+
+        renames_str = item.get("renames") or f"{item.get('applied', 0)} / {item.get('rejected', 0)}"
+        values = (
+            idx,
+            item.get("address", ""),
+            item.get("func_name", ""),
+            renames_str,
+            item.get("details", ""),
+            status_val,
+        )
+        self.tree.insert("", "end", values=values, tags=(tag,))
+        self.after_idle(self._update_column_separators)
+
+    def set_items(self, items: list[dict]) -> None:
+        self.items = list(items)
+        self.refresh()
+
+    def clear(self) -> None:
+        self.items.clear()
+        self.refresh()
+
+    def count(self) -> int:
+        return len(self.items)
+
+    def set_filter(self, text: str) -> None:
+        self.filter_text = text.strip().lower()
+        self.refresh()
+
+    def _filtered_items(self) -> list[dict]:
+        ft = self.filter_text
+        if not ft:
+            res = list(self.items)
+        else:
+            res = []
+            for it in self.items:
+                addr = str(it.get("address", "")).lower()
+                fn = str(it.get("func_name", "")).lower()
+                dt = str(it.get("details", "")).lower()
+                st = str(it.get("status", "")).lower()
+                if ft in addr or ft in fn or ft in dt or ft in st:
+                    res.append(it)
+
+        def sort_val(it: dict):
+            val = it.get(self.sort_col, "")
+            if self.sort_col == "address":
+                try:
+                    return int(str(val), 16)
+                except ValueError:
+                    return 0
+            if self.sort_col == "renames":
+                try:
+                    return int(str(it.get("applied", 0)))
+                except (ValueError, TypeError):
+                    return 0
+            return str(val).lower()
+
+        res.sort(key=sort_val, reverse=self.sort_desc)
+        return res
+
+    def refresh(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        filtered = self._filtered_items()
+        if not self.items:
+            self.empty_label.configure(text="No variable renames recorded yet.\nRun OmniIDB on a sample with 'Rename local variables' enabled.")
+            self.empty_frame.place(relx=0.5, rely=0.45, anchor="center")
+        elif not filtered:
+            self.empty_label.configure(text="No variables match the active filter.")
+            self.empty_frame.place(relx=0.5, rely=0.45, anchor="center")
+        else:
+            self.empty_frame.place_forget()
+            for idx, it in enumerate(filtered, 1):
+                status_val = str(it.get("status", "Complete"))
+                tag = "ok"
+                if "no changes" in status_val.lower() or "reject" in status_val.lower() or "fail" in status_val.lower():
+                    tag = "warn"
+
+                renames_str = it.get("renames") or f"{it.get('applied', 0)} / {it.get('rejected', 0)}"
+                values = (
+                    idx,
+                    it.get("address", ""),
+                    it.get("func_name", ""),
+                    renames_str,
+                    it.get("details", ""),
+                    status_val,
+                )
+                self.tree.insert("", "end", values=values, tags=(tag,))
+
+        self.after_idle(self._update_column_separators)
+
+
+class ErrorTableView(tk.Frame):
+    """Interactive error tracking table for real-time error logging, diagnostics, and export."""
+
+    COLS = ("n", "time", "severity", "stage", "sample", "message")
+
+    def __init__(self, master, on_copy: Optional[Callable[[str], None]] = None):
+        super().__init__(master, bg=CONSOLE_BG)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.on_copy = on_copy
+        self.items: list[dict] = []
+        self.filter_text = ""
+        self.sort_col = "n"
+        self.sort_desc = False
+
+        self.tree = ttk.Treeview(self, columns=self.COLS, show="headings", selectmode="extended", style="Omni.Treeview")
+        self.orig_heads = {
+            "n": ("#", 45, 36),
+            "time": ("Time", 85, 70),
+            "severity": ("Severity", 95, 75),
+            "stage": ("Stage / Source", 140, 100),
+            "sample": ("Sample / Target", 220, 130),
+            "message": ("Error Details & Diagnostics", 480, 200),
+        }
+        for col in self.COLS:
+            title, width, minw = self.orig_heads[col]
+            self.tree.heading(col, text=title, command=lambda c=col: self._on_heading_click(c))
+            self.tree.column(col, width=width, minwidth=minw, anchor="w", stretch=(col == "message"))
+
+        self.tree.tag_configure("error", background=STATUS_COLORS["Failed"][0], foreground=STATUS_COLORS["Failed"][1])
+        self.tree.tag_configure("warn", background=AMBER_BG, foreground=AMBER)
+        self.tree.tag_configure("fatal", background="#4A0D0D", foreground="#FFA4A4")
+
+        # Vertical divider lines between columns
+        self.seps: list[tk.Frame] = []
+        for _ in self.COLS[:-1]:
+            sep = tk.Frame(self.tree, width=1, bg="#2D3B4F")
+            self.seps.append(sep)
+
+        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview, style="Vertical.TScrollbar")
+        self.xscroll = ttk.Scrollbar(self, orient="horizontal", command=self._on_xscroll_cmd, style="Horizontal.TScrollbar")
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=self._on_xscroll_set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        self.xscroll.grid(row=1, column=0, sticky="ew")
+
+        # Responsive divider lines tracking
+        self.tree.bind("<Configure>", lambda e: self._update_column_separators(), add="+")
+        self.tree.bind("<B1-Motion>", lambda e: self._update_column_separators(), add="+")
+        self.tree.bind("<ButtonRelease-1>", lambda e: self.after_idle(self._update_column_separators), add="+")
+
+        # Keyboard shortcuts
+        self.tree.bind("<Control-c>", lambda e: self._on_copy_key())
+        self.tree.bind("<Control-C>", lambda e: self._on_copy_key())
+        self.tree.bind("<Control-a>", lambda e: self._on_select_all_key())
+        self.tree.bind("<Control-A>", lambda e: self._on_select_all_key())
+
+        # Context Menu
+        self.context_menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=BLUE, activeforeground="#FFFFFF", font=UI_FONT)
+        self.context_menu.add_command(label="Copy Error Message", command=self._copy_message)
+        self.context_menu.add_command(label="Copy Sample / Target", command=self._copy_sample)
+        self.context_menu.add_command(label="Copy Stage", command=self._copy_stage)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Copy Selected Row(s)", command=self._copy_selected_rows)
+        self.context_menu.add_command(label="Copy All Errors (Table)", command=self.copy_all)
+        self.context_menu.add_command(label="Copy All Messages", command=self.copy_messages)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Select All", command=self._select_all_rows)
+        self.tree.bind("<Button-3>", self._on_right_click)
+
+        # Empty State
+        self.empty_frame = tk.Frame(self, bg=CONSOLE_BG)
+        self.empty_label = tk.Label(
+            self.empty_frame,
+            text="No errors recorded.\nAll batch operations running smoothly without errors.",
+            bg=CONSOLE_BG,
+            fg=DIM,
+            font=UI_FONT,
+            justify="center",
+        )
+        self.empty_label.pack()
+        self.refresh()
+
+    def _on_xscroll_cmd(self, *args) -> None:
+        self.tree.xview(*args)
+        self._update_column_separators()
+
+    def _on_xscroll_set(self, first, last) -> None:
+        self.xscroll.set(first, last)
+        self._update_column_separators()
+
+    def _update_column_separators(self, event=None) -> None:
+        if not hasattr(self, "seps") or not self.seps:
+            return
+        cols = self.tree["columns"]
+        if not cols:
+            return
+        try:
+            total_w = sum(self.tree.column(c, "width") for c in cols)
+            xview = self.tree.xview()
+            scroll_offset = int(round(xview[0] * total_w)) if xview and total_w else 0
+        except Exception:
+            scroll_offset = 0
+
+        heading_h = 26
+        cur_x = -scroll_offset
+        tree_w = self.tree.winfo_width()
+        for idx, col in enumerate(cols[:-1]):
+            if idx >= len(self.seps):
+                break
+            cur_x += self.tree.column(col, "width")
+            if cur_x < 0 or (tree_w > 1 and cur_x > tree_w):
+                self.seps[idx].place_forget()
+            else:
+                self.seps[idx].place(x=cur_x, y=heading_h, relheight=1.0, height=-heading_h)
+
+    def _on_heading_click(self, col: str) -> None:
+        if self.sort_col == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col = col
+            self.sort_desc = False
+        self._update_headings()
+        self.refresh()
+
+    def _update_headings(self) -> None:
+        for col in self.COLS:
+            title, _, _ = self.orig_heads[col]
+            if col == self.sort_col:
+                arrow = " ▼" if self.sort_desc else " ▲"
+                self.tree.heading(col, text=f"{title}{arrow}")
+            else:
+                self.tree.heading(col, text=title)
+
+    def _on_right_click(self, event) -> None:
+        row_id = self.tree.identify_row(event.y)
+        if row_id and row_id not in self.tree.selection():
+            self.tree.selection_set(row_id)
+        self.context_menu.post(event.x_root, event.y_root)
+
+    def _select_all_rows(self) -> None:
+        children = self.tree.get_children()
+        if children:
+            self.tree.selection_set(children)
+
+    def _on_select_all_key(self, event=None) -> str:
+        self._select_all_rows()
+        return "break"
+
+    def _on_copy_key(self, event=None) -> str:
+        if self.tree.selection():
+            self._copy_selected_rows()
+        else:
+            self.copy_all()
+        return "break"
+
+    def _get_first_selected_values(self) -> Optional[list]:
+        sel = self.tree.selection()
+        if sel:
+            item = self.tree.item(sel[0])
+            return item.get("values", [])
+        return None
+
+    def _copy_message(self) -> None:
+        vals = self._get_first_selected_values()
+        if vals and len(vals) > 5 and self.on_copy:
+            self.on_copy(str(vals[5]))
+
+    def _copy_sample(self) -> None:
+        vals = self._get_first_selected_values()
+        if vals and len(vals) > 4 and self.on_copy:
+            self.on_copy(str(vals[4]))
+
+    def _copy_stage(self) -> None:
+        vals = self._get_first_selected_values()
+        if vals and len(vals) > 3 and self.on_copy:
+            self.on_copy(str(vals[3]))
+
+    def _copy_selected_rows(self) -> None:
+        sel = self.tree.selection()
+        if not sel or not self.on_copy:
+            return
+        lines = []
+        for iid in sel:
+            vals = self.tree.item(iid).get("values", [])
+            lines.append("\t".join(str(v) for v in vals))
+        self.on_copy("\n".join(lines))
+
+    def copy_all(self) -> int:
+        if not self.on_copy:
+            return 0
+        children = self.tree.get_children()
+        if not children:
+            return 0
+        lines = ["\t".join(self.orig_heads[c][0] for c in self.COLS)]
+        for iid in children:
+            vals = self.tree.item(iid).get("values", [])
+            lines.append("\t".join(str(v) for v in vals))
+        self.on_copy("\n".join(lines))
+        return len(children)
+
+    def copy_messages(self) -> int:
+        if not self.on_copy:
+            return 0
+        children = self.tree.get_children()
+        if not children:
+            return 0
+        lines = []
+        for iid in children:
+            vals = self.tree.item(iid).get("values", [])
+            if len(vals) > 5 and vals[5]:
+                time_str = f"[{vals[1]}] " if len(vals) > 1 and vals[1] else ""
+                stage_str = f"[{vals[3]}] " if len(vals) > 3 and vals[3] else ""
+                sample_str = f"{vals[4]}: " if len(vals) > 4 and vals[4] else ""
+                lines.append(f"{time_str}{stage_str}{sample_str}{vals[5]}")
+            elif len(vals) > 5:
+                lines.append(str(vals[5]))
+        if lines:
+            self.on_copy("\n".join(lines))
+            return len(lines)
+        return 0
+
+    def export_csv(self, filepath: str) -> None:
+        import csv
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([self.orig_heads[c][0] for c in self.COLS])
+            for iid in self.tree.get_children():
+                vals = self.tree.item(iid).get("values", [])
+                writer.writerow(vals)
+
+    def add_item(self, item: dict) -> None:
+        self.items.append(item)
+        if self.filter_text:
+            self.refresh()
+            return
+        if self.sort_col != "n" or self.sort_desc:
+            self.refresh()
+            return
+
+        self.empty_frame.place_forget()
+        idx = len(self.items)
+        sev = str(item.get("severity", "Error")).lower()
+        tag = "warn" if "warn" in sev else ("fatal" if "fatal" in sev else "error")
+        msg = item.get("message", "")
+        details = item.get("details", "")
+        full_msg = f"{msg} — {details}" if details and details != msg else msg
+        values = (
+            idx,
+            item.get("time", ""),
+            item.get("severity", "Error"),
+            item.get("stage", "General"),
+            item.get("sample", ""),
+            full_msg,
+        )
+        self.tree.insert("", "end", values=values, tags=(tag,))
+        self.after_idle(self._update_column_separators)
+
+    def set_items(self, items: list[dict]) -> None:
+        self.items = list(items)
+        self.refresh()
+
+    def clear(self) -> None:
+        self.items.clear()
+        self.refresh()
+
+    def count(self) -> int:
+        return len(self.items)
+
+    def set_filter(self, text: str) -> None:
+        self.filter_text = text.strip().lower()
+        self.refresh()
+
+    def _filtered_items(self) -> list[dict]:
+        ft = self.filter_text
+        if not ft:
+            res = list(self.items)
+        else:
+            res = []
+            for it in self.items:
+                sev = str(it.get("severity", "")).lower()
+                stg = str(it.get("stage", "")).lower()
+                smp = str(it.get("sample", "")).lower()
+                msg = str(it.get("message", "")).lower()
+                det = str(it.get("details", "")).lower()
+                if ft in sev or ft in stg or ft in smp or ft in msg or ft in det:
+                    res.append(it)
+
+        def sort_val(it: dict):
+            val = it.get(self.sort_col, "")
+            return str(val).lower()
+
+        res.sort(key=sort_val, reverse=self.sort_desc)
+        return res
+
+    def refresh(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        filtered = self._filtered_items()
+        if not self.items:
+            self.empty_label.configure(text="No errors recorded.\nAll batch operations running smoothly without errors.")
+            self.empty_frame.place(relx=0.5, rely=0.45, anchor="center")
+        elif not filtered:
+            self.empty_label.configure(text="No errors match the active filter.")
+            self.empty_frame.place(relx=0.5, rely=0.45, anchor="center")
+        else:
+            self.empty_frame.place_forget()
+            for idx, it in enumerate(filtered, 1):
+                sev_val = str(it.get("severity", "Error")).capitalize()
+                tag = "error"
+                if "warn" in sev_val.lower():
+                    tag = "warn"
+                elif "fatal" in sev_val.lower() or "critical" in sev_val.lower():
+                    tag = "fatal"
+
+                msg_display = it.get("message", "")
+                if it.get("details"):
+                    msg_display = f"{msg_display} | {it.get('details')}"
+
+                values = (
+                    idx,
+                    it.get("time", ""),
+                    sev_val,
+                    it.get("stage", ""),
+                    it.get("sample", ""),
+                    msg_display,
+                )
+                self.tree.insert("", "end", values=values, tags=(tag,))
+
+        self.after_idle(self._update_column_separators)
 
 
 class ScrollableColumn(tk.Frame):
@@ -992,7 +2010,7 @@ def apply_theme(root: tk.Tk) -> None:
 
     # Treeview (Sample queue) with JetBrains Mono
     style.configure("Omni.Treeview", background=CONSOLE_BG, fieldbackground=CONSOLE_BG, foreground=FG, font=UI_FONT, rowheight=24, borderwidth=0)
-    style.configure("Omni.Treeview.Heading", background=CARD, foreground=MUTED, font=(FONT_FAMILY, 8, "bold"), relief="flat", borderwidth=0)
+    style.configure("Omni.Treeview.Heading", background=CARD, foreground=MUTED, font=(FONT_FAMILY, 8, "bold"), relief="solid", borderwidth=1, bordercolor="#2D3B4F")
     style.map("Omni.Treeview", background=[("selected", "#1D4ED8")])
 
     root.option_add("*TCombobox*Listbox.background", INPUT_BG)
@@ -1004,7 +2022,7 @@ def apply_theme(root: tk.Tk) -> None:
 
 # ---------------------------------------------------------------- app
 class OmniApp:
-    TABS = ("Queue", "Log", "IdaLog")
+    TABS = ("Queue", "Functions", "Variables", "Errors", "Log", "IdaLog")
 
     def __init__(self, root: tk.Tk, initial_path: Optional[str] = None):
         self.root = root
@@ -1097,15 +2115,14 @@ class OmniApp:
         self.v_goresym = tk.StringVar(value=go_path)
         self.v_provider = tk.StringVar(value=s.provider)
         self.v_url = tk.StringVar(value=s.api_url)
-        self.v_key = tk.StringVar()
+        self.v_key = tk.StringVar(value=s.get_api_key(s.provider))
         self.v_model = tk.StringVar(value=s.model)
         self.v_exe = tk.StringVar(value=s.executable)
-        # By default uncheck Enable Fallback Provider
-        self.v_fallback_enabled = tk.BooleanVar(value=False)
+        self.v_fallback_enabled = tk.BooleanVar(value=s.fallback_enabled)
         self.testing_target = "main"
         self.v_fallback_provider = tk.StringVar(value=s.fallback_provider)
         self.v_fallback_url = tk.StringVar(value=s.fallback_api_url)
-        self.v_fallback_key = tk.StringVar()
+        self.v_fallback_key = tk.StringVar(value=s.get_api_key(s.fallback_provider))
         self.v_fallback_model = tk.StringVar(value=s.fallback_model)
         self.v_fallback_exe = tk.StringVar(value=s.fallback_executable)
         self.v_rename_fn = tk.BooleanVar(value=s.rename_functions)
@@ -1122,15 +2139,39 @@ class OmniApp:
         self.v_batch = tk.IntVar(value=s.batch_size)
         self.v_workers = tk.IntVar(value=getattr(s, "workers", 3))
         self.v_low_score_rescan = tk.BooleanVar(value=getattr(s, "low_score_rescan", False))
+        self.v_cooldown = tk.IntVar(value=getattr(s, "cooldown_seconds", 1))
         self.v_cache = tk.BooleanVar(value=s.use_rename_cache)
         self.v_token_budget = tk.IntVar(value=s.token_budget)
         self.v_filter = tk.StringVar()
         self.v_status_filter = tk.StringVar(value="All")
+        self.v_func_filter = tk.StringVar()
+        self.v_var_filter = tk.StringVar()
+        self.v_err_filter = tk.StringVar()
         self.v_queued = tk.StringVar(value="0 sample(s) queued")
         self.sort_col: Optional[str] = None
         self.sort_desc: bool = False
         for var in (self.v_filter, self.v_status_filter):
             var.trace_add("write", lambda *_: self._mark_queue())
+        self.v_func_filter.trace_add("write", lambda *_: self.func_view.set_filter(self.v_func_filter.get()) if hasattr(self, "func_view") else None)
+        self.v_var_filter.trace_add("write", lambda *_: self.var_view.set_filter(self.v_var_filter.get()) if hasattr(self, "var_view") else None)
+        self.v_err_filter.trace_add("write", lambda *_: self.error_view.set_filter(self.v_err_filter.get()) if hasattr(self, "error_view") else None)
+
+        def _on_key_write(*_):
+            self.settings.set_api_key(self.v_provider.get(), self.v_key.get())
+            try:
+                self.settings.save()
+            except OSError:
+                pass
+
+        def _on_fb_key_write(*_):
+            self.settings.set_api_key(self.v_fallback_provider.get(), self.v_fallback_key.get())
+            try:
+                self.settings.save()
+            except OSError:
+                pass
+
+        self.v_key.trace_add("write", _on_key_write)
+        self.v_fallback_key.trace_add("write", _on_fb_key_write)
 
     def _pull_settings(self) -> None:
         """Copy widget values back into ``self.settings``."""
@@ -1145,11 +2186,13 @@ class OmniApp:
         s.api_url = self.v_url.get()
         s.model = self.v_model.get()
         s.executable = self.v_exe.get()
+        s.set_api_key(self.v_provider.get(), self.v_key.get())
         s.fallback_enabled = self.v_fallback_enabled.get()
         s.fallback_provider = self.v_fallback_provider.get()
         s.fallback_api_url = self.v_fallback_url.get()
         s.fallback_model = self.v_fallback_model.get()
         s.fallback_executable = self.v_fallback_exe.get()
+        s.set_api_key(self.v_fallback_provider.get(), self.v_fallback_key.get())
         s.rename_functions = self.v_rename_fn.get()
         s.rename_functions_with_address = self.v_rename_fn_addr.get()
         s.rename_variables = self.v_rename_var.get()
@@ -1168,8 +2211,16 @@ class OmniApp:
             s.batch_size = max(1, min(50, int(self.v_batch.get())))
             s.workers = max(1, min(8, int(self.v_workers.get())))
             s.low_score_rescan = self.v_low_score_rescan.get()
+            s.cooldown_seconds = max(0, min(60, int(self.v_cooldown.get())))
             s.token_budget = max(0, int(self.v_token_budget.get()))
         except (tk.TclError, ValueError):
+            pass
+
+    def _save_settings(self) -> None:
+        try:
+            self._pull_settings()
+            self.settings.save()
+        except OSError:
             pass
 
     # ------------------------------------------------------------ UI build
@@ -1561,23 +2612,27 @@ class OmniApp:
         self.btn_goresym_update = RoundedButton(g_btns, "⬇ Update", command=self._on_update_goresym, bg_color=CARD, padx=6, pady=3, radius=6)
         self.btn_goresym_update.pack(side="left")
 
-        # Row 3: AI Batch Size + Concurrency (Workers)
-        tk.Label(ida_grid, text="AI Batch & Workers:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=2, column=0, pady=(6, 0), sticky="w")
+        # Row 3: AI Batch Size, Concurrency (Workers) & Cooldown Pacing
+        tk.Label(ida_grid, text="AI Batch & Pacing:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=2, column=0, pady=(6, 0), sticky="w")
         brow = tk.Frame(ida_grid, bg=CARD)
         brow.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Spinbox(brow, from_=1, to=50, textvariable=self.v_batch, width=4).pack(side="left")
-        make_help_badge(brow, "Number of functions grouped into each AI prompt (default 15). Larger batches significantly reduce API roundtrips.").pack(side="left", padx=(4, 8))
+        tk.Label(brow, text="Batch:", bg=CARD, fg=FG, font=UI_FONT_BOLD).pack(side="left")
+        ttk.Spinbox(brow, from_=1, to=50, textvariable=self.v_batch, width=3).pack(side="left", padx=(4, 0))
+        make_help_badge(brow, "Number of functions grouped into each AI prompt (default 15). Larger batches significantly reduce API roundtrips.").pack(side="left", padx=(3, 8))
         tk.Label(brow, text="Workers:", bg=CARD, fg=FG, font=UI_FONT_BOLD).pack(side="left")
-        ttk.Spinbox(brow, from_=1, to=8, textvariable=self.v_workers, width=3).pack(side="left", padx=(4, 0))
-        make_help_badge(brow, "Parallel AI request worker threads (1-8, default 3). Pre-extracts functions on IDA main thread, queries AI concurrently across workers, then safely applies names back in IDA.").pack(side="left", padx=(4, 8))
-        tk.Label(brow, text="threads", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
+        ttk.Spinbox(brow, from_=1, to=8, textvariable=self.v_workers, width=2).pack(side="left", padx=(4, 0))
+        make_help_badge(brow, "Parallel AI request worker threads (1-8, default 3). Cloud API providers can query concurrently; account, CLI, OpenAI-compatible, and local providers are automatically serialized to prevent session/model stalls.").pack(side="left", padx=(3, 8))
+        tk.Label(brow, text="Cooldown:", bg=CARD, fg=FG, font=UI_FONT_BOLD).pack(side="left")
+        ttk.Spinbox(brow, from_=0, to=30, textvariable=self.v_cooldown, width=3).pack(side="left", padx=(4, 0))
+        make_help_badge(brow, "Small delay in seconds between AI requests (default 1s). Prevents rate limiting, throttling, and 120s timeout queue stalls on AntigravityCLI, Gemini, and OpenAI. 0 = disabled.").pack(side="left", padx=(3, 4))
+        tk.Label(brow, text="sec", bg=CARD, fg=DIM, font=SUB_FONT).pack(side="left")
 
         # Row 4: Low-score Rescan
         tk.Label(ida_grid, text="Low-score Rescan:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=3, column=0, pady=(6, 0), sticky="w")
         lsrow = tk.Frame(ida_grid, bg=CARD)
         lsrow.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(lsrow, text="Enable low-score rescan (slow, re-analyzes ≤50% scores individually)", variable=self.v_low_score_rescan).pack(side="left")
-        make_help_badge(lsrow, "When unchecked (recommended), accepts wrapper names (wrap_*) to finish much faster. When checked, re-analyzes every low-scoring function one-by-one, which can be significantly slower.").pack(side="left", padx=6)
+        make_help_badge(lsrow, "When unchecked (default, recommended), keeps low-score rescan disabled so function renaming finishes much faster without extra rate-limit pressure. When checked, re-analyzes low-scoring functions individually.").pack(side="left", padx=6)
 
         # Row 5: Rename Cache
         tk.Label(ida_grid, text="Rename Cache:", bg=CARD, fg=FG, font=UI_FONT_BOLD, width=15, anchor="w").grid(row=4, column=0, pady=(6, 0), sticky="w")
@@ -1615,6 +2670,13 @@ class OmniApp:
         )
         self.run_btn.pack(side="left", padx=(0, 8))
 
+        self.resume_btn = RoundedButton(
+            run_bar, "⏯  Resume", command=self.on_resume,
+            fill="#059669", hover_fill="#10B981", outline="#34D399", text_color="#FFFFFF",
+            font=BUTTON_FONT, padx=14, pady=6, radius=6, state="disabled", bg_color=BG,
+        )
+        self.resume_btn.pack(side="left", padx=(0, 8))
+
         self.cancel_btn = RoundedButton(
             run_bar, "⏹  Stop", command=self.on_cancel,
             fill=BTN_BG, hover_fill=BTN_HOVER, outline=BTN_BORDER, text_color=FG,
@@ -1640,6 +2702,9 @@ class OmniApp:
         self.tab_buttons: dict[str, tk.Button] = {}
         tab_labels = {
             "Queue": "Sample Queue",
+            "Functions": "Functions",
+            "Variables": "Variables",
+            "Errors": "Errors",
             "Log": "Activity Log",
             "IdaLog": "ida.log",
         }
@@ -1671,15 +2736,26 @@ class OmniApp:
             self.pages["Queue"],
             compact=False,
             on_open_output=self.open_sample_output_folder,
+            on_delete_output=self.delete_sample_output_folder,
             on_open_report=self.open_sample_report,
             on_open_location=self.open_sample_location,
             on_copy_path=self.copy_sample_path,
             on_copy_md5=self.copy_sample_md5,
             on_remove_sample=self.remove_sample_by_id,
             on_sort=self._on_sort_column,
+            on_select=self._on_sample_selected,
             is_running_fn=lambda: self.running,
         )
         self.queue_full.pack(fill="both", expand=True)
+
+        self.func_view = FunctionTableView(self.pages["Functions"], on_copy=self._copy)
+        self.func_view.pack(fill="both", expand=True)
+
+        self.var_view = VariableTableView(self.pages["Variables"], on_copy=self._copy)
+        self.var_view.pack(fill="both", expand=True)
+
+        self.error_view = ErrorTableView(self.pages["Errors"], on_copy=self._copy)
+        self.error_view.pack(fill="both", expand=True)
         self.log_view = LogView(
             self.pages["Log"],
             activity_color,
@@ -1714,13 +2790,42 @@ class OmniApp:
         )
         clear_btn.pack(side="right", padx=(6, 0))
 
-        if tab == "Log":
+        if tab == "Functions":
+            RoundedButton(c, "Export CSV...", command=self._export_functions_csv, bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
+            RoundedButton(c, "Copy All", command=lambda: self.func_view.copy_all() if hasattr(self, "func_view") else None, bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
+            entry = ttk.Entry(c, textvariable=self.v_func_filter, width=16)
+            entry.pack(side="right", padx=4)
+            tk.Label(c, text="🔍 Filter:", bg=CARD, fg=MUTED, font=SUB_FONT).pack(side="right", padx=(4, 2))
+        elif tab == "Variables":
+            RoundedButton(c, "Export CSV...", command=self._export_variables_csv, bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
+            RoundedButton(c, "Copy All", command=lambda: self.var_view.copy_all() if hasattr(self, "var_view") else None, bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
+            entry = ttk.Entry(c, textvariable=self.v_var_filter, width=16)
+            entry.pack(side="right", padx=4)
+            tk.Label(c, text="🔍 Filter:", bg=CARD, fg=MUTED, font=SUB_FONT).pack(side="right", padx=(4, 2))
+        elif tab == "Errors":
+            RoundedButton(c, "Export CSV...", command=self._export_errors_csv, bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
+            btn_copy_msg = None
+            def on_msg_copy():
+                self._on_copy_error_messages(btn_copy_msg)
+            btn_copy_msg = RoundedButton(c, "Copy Messages", command=on_msg_copy, bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT)
+            btn_copy_msg.pack(side="right", padx=2)
+
+            btn_copy_all = None
+            def on_all_copy():
+                self._on_copy_all_errors(btn_copy_all)
+            btn_copy_all = RoundedButton(c, "Copy All", command=on_all_copy, bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT)
+            btn_copy_all.pack(side="right", padx=2)
+
+            entry = ttk.Entry(c, textvariable=self.v_err_filter, width=16)
+            entry.pack(side="right", padx=4)
+            tk.Label(c, text="🔍 Filter:", bg=CARD, fg=MUTED, font=SUB_FONT).pack(side="right", padx=(4, 2))
+        elif tab == "Log":
             RoundedButton(c, "Save...", command=lambda: self._save_log_to_file("Log"), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
             RoundedButton(c, "Copy", command=lambda: self._copy("\r\n".join(self.logs)), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
-        if tab == "IdaLog":
+        elif tab == "IdaLog":
             RoundedButton(c, "Save...", command=lambda: self._save_log_to_file("IdaLog"), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
             RoundedButton(c, "Copy", command=lambda: self._copy("\r\n".join(self.ida_logs)), bg_color=CARD, padx=8, pady=2, radius=6, font=SMALL_BTN_FONT).pack(side="right", padx=2)
-        if tab == "Queue" and len(self.samples) >= 1:
+        elif tab == "Queue" and len(self.samples) >= 1:
             entry = ttk.Entry(c, textvariable=self.v_filter, width=14)
             entry.pack(side="right", padx=4)
             tk.Label(c, text="🔍 Filter:", bg=CARD, fg=MUTED, font=SUB_FONT).pack(side="right", padx=(4, 2))
@@ -1737,6 +2842,18 @@ class OmniApp:
             self._clear_logs()
         elif self.console_tab == "IdaLog":
             self._clear_ida_logs()
+        elif self.console_tab == "Functions":
+            if hasattr(self, "func_view"):
+                self.func_view.clear()
+            self._update_tab_titles()
+        elif self.console_tab == "Variables":
+            if hasattr(self, "var_view"):
+                self.var_view.clear()
+            self._update_tab_titles()
+        elif self.console_tab == "Errors":
+            if hasattr(self, "error_view"):
+                self.error_view.clear()
+            self._update_tab_titles()
         elif self.console_tab == "Queue":
             if self.running:
                 messagebox.showwarning(
@@ -1897,6 +3014,54 @@ class OmniApp:
         except Exception as exc:
             messagebox.showerror("Error Opening Folder", f"Could not open output folder:\n{exc}", parent=self.root)
 
+    def delete_sample_output_folder(self, item_id: str) -> None:
+        """Permanently delete the target sample's output directory after confirmation."""
+        try:
+            idx = int(item_id)
+            if 0 <= idx < len(self.samples):
+                sample = self.samples[idx]
+                out_root = self.v_output.get().strip() or self.settings.output_root.strip()
+                if not out_root:
+                    messagebox.showinfo(
+                        "No Output Directory",
+                        "Please specify an output directory first.",
+                        parent=self.root,
+                    )
+                    return
+                from .runner import sanitize, sha256_file
+                digest = sha256_file(sample.path)
+                folder = f"{sanitize(sample.path.stem)}-{digest[:12]}"
+                target = Path(out_root) / folder
+                if not target.exists():
+                    messagebox.showinfo(
+                        "Output Folder Not Found",
+                        f"Output folder does not exist:\n{target}",
+                        parent=self.root,
+                    )
+                    return
+
+                confirm = messagebox.askyesno(
+                    "Delete Output Folder",
+                    f"Are you sure you want to permanently delete the output folder for '{sample.path.name}'?\n\n"
+                    f"{target}\n\n"
+                    "This will permanently remove all generated IDB files, reports, and decompiled workspaces.",
+                    parent=self.root,
+                    icon="warning",
+                )
+                if not confirm:
+                    return
+
+                import shutil
+                shutil.rmtree(target)
+                self._add_logs([f"[+] Deleted output folder: {target}"])
+                messagebox.showinfo(
+                    "Output Folder Deleted",
+                    f"Successfully deleted output folder for '{sample.path.name}':\n{target}",
+                    parent=self.root,
+                )
+        except Exception as exc:
+            messagebox.showerror("Delete Error", f"Could not delete output folder:\n{exc}", parent=self.root)
+
     def open_sample_report(self, item_id: str, fmt: str = "html") -> None:
         """Open the target sample's generated HTML or PDF report in the default system viewer."""
         try:
@@ -2003,6 +3168,118 @@ class OmniApp:
         self._mark_queue()
         if hasattr(self, "queue_full"):
             self.queue_full.update_sort_indicators(self.sort_col, self.sort_desc)
+
+    def _on_sample_selected(self, item_id: str) -> None:
+        try:
+            idx = int(item_id)
+            if not (0 <= idx < len(self.samples)):
+                return
+            sample = self.samples[idx]
+            out_root = self.v_output.get().strip() or self.settings.output_root.strip()
+            if not out_root:
+                return
+            folder = sample_output_folder(sample.path)
+            result_file = target / "result.json"
+            if not result_file.is_file():
+                result_file = target / "report" / "result.json"
+            failure_file = target / "logs" / "failure.txt"
+            if result_file.is_file():
+                import json
+                data = json.loads(result_file.read_text(encoding="utf-8"))
+                fn_items = (data.get("function_rename") or {}).get("items") or data.get("renamed_functions") or []
+                var_items = (data.get("variable_rename") or {}).get("items") or []
+                if hasattr(self, "func_view") and fn_items:
+                    self.func_view.set_items(fn_items)
+                if hasattr(self, "var_view") and var_items:
+                    self.var_view.set_items(var_items)
+                self._update_tab_titles()
+            if failure_file.is_file() and hasattr(self, "error_view"):
+                fail_text = failure_file.read_text(encoding="utf-8", errors="replace").strip()
+                if fail_text:
+                    first_line = fail_text.splitlines()[0]
+                    exists = any(
+                        it.get("sample") == sample.path.name and first_line in it.get("message", "")
+                        for it in self.error_view.items
+                    )
+                    if not exists:
+                        self.error_view.add_item({
+                            "time": time.strftime("%H:%M:%S"),
+                            "severity": "Error",
+                            "stage": "Failed Execution",
+                            "sample": sample.path.name,
+                            "message": first_line,
+                            "details": "\n".join(fail_text.splitlines()[1:]),
+                        })
+                        self._update_tab_titles()
+        except Exception:
+            pass
+
+    def _export_functions_csv(self) -> None:
+        if not hasattr(self, "func_view") or self.func_view.count() == 0:
+            messagebox.showinfo("Export Functions", "No function renames to export.", parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export Renamed Functions to CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+            initialfile="renamed_functions.csv",
+        )
+        if path:
+            try:
+                self.func_view.export_csv(path)
+                messagebox.showinfo("Export Successful", f"Saved {self.func_view.count()} function(s) to:\n{path}", parent=self.root)
+            except Exception as exc:
+                messagebox.showerror("Export Failed", f"Could not export CSV:\n{exc}", parent=self.root)
+
+    def _export_variables_csv(self) -> None:
+        if not hasattr(self, "var_view") or self.var_view.count() == 0:
+            messagebox.showinfo("Export Variables", "No variable renames to export.", parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export Renamed Variables to CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+            initialfile="renamed_variables.csv",
+        )
+        if path:
+            try:
+                self.var_view.export_csv(path)
+                messagebox.showinfo("Export Successful", f"Saved {self.var_view.count()} variable row(s) to:\n{path}", parent=self.root)
+            except Exception as exc:
+                messagebox.showerror("Export Failed", f"Could not export CSV:\n{exc}", parent=self.root)
+
+    def _export_errors_csv(self) -> None:
+        if not hasattr(self, "error_view") or self.error_view.count() == 0:
+            messagebox.showinfo("Export Errors", "No errors to export.", parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export Errors to CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+            initialfile="errors.csv",
+        )
+        if path:
+            try:
+                self.error_view.export_csv(path)
+                messagebox.showinfo("Export Successful", f"Saved {self.error_view.count()} error row(s) to:\n{path}", parent=self.root)
+            except Exception as exc:
+                messagebox.showerror("Export Failed", f"Could not export CSV:\n{exc}", parent=self.root)
+
+    def _on_copy_all_errors(self, btn: Optional[RoundedButton] = None) -> None:
+        if hasattr(self, "error_view"):
+            count = self.error_view.copy_all()
+            if btn:
+                orig_text = btn.text
+                btn.set_text("✓ Copied!" if count > 0 else "Empty")
+                self.root.after(1400, lambda: btn.set_text(orig_text) if btn.winfo_exists() else None)
+
+    def _on_copy_error_messages(self, btn: Optional[RoundedButton] = None) -> None:
+        if hasattr(self, "error_view"):
+            count = self.error_view.copy_messages()
+            if btn:
+                orig_text = btn.text
+                btn.set_text("✓ Copied!" if count > 0 else "Empty")
+                self.root.after(1400, lambda: btn.set_text(orig_text) if btn.winfo_exists() else None)
 
     def _agent_toggled(self) -> None:
         if self.v_agent.get():
@@ -2137,12 +3414,13 @@ class OmniApp:
         self.v_url.set(self.settings.api_url)
         self.v_model.set(self.settings.model)
         self.v_exe.set(self.settings.executable)
-        self.v_key.set("")
+        self.v_key.set(self.settings.get_api_key(self.v_provider.get()))
         self._set_test_pill(None, "")
         if hasattr(self, "model_box"):
             self.model_box["values"] = default_models_for_provider(self.v_provider.get())
         self._provider_layout()
         self._update_analyze_workspace_state()
+        self._save_settings()
 
     def _fallback_toggled(self) -> None:
         if self.v_fallback_enabled.get():
@@ -2169,11 +3447,12 @@ class OmniApp:
         self.v_fallback_url.set(self.settings.fallback_api_url)
         self.v_fallback_model.set(self.settings.fallback_model)
         self.v_fallback_exe.set(self.settings.fallback_executable)
-        self.v_fallback_key.set("")
+        self.v_fallback_key.set(self.settings.get_api_key(self.v_fallback_provider.get()))
         if hasattr(self, "fb_model_box"):
             self.fb_model_box["values"] = default_models_for_provider(self.v_fallback_provider.get())
         self._fallback_layout()
         self._update_analyze_workspace_state()
+        self._save_settings()
 
 
     def _fallback_layout(self) -> None:
@@ -2339,7 +3618,7 @@ class OmniApp:
         else:
             bg_c, border_c, fg_c, icon = "#162033", "#2563EB", "#93C5FD", "⏳ "
 
-        display_msg = message if len(message) <= 45 else message[:42] + "..."
+        display_msg = message.strip().replace("\r\n", " ").replace("\n", " ")
         self.test_badge.configure(bg=bg_c, highlightthickness=1, highlightbackground=border_c)
         self.test_badge_lbl.configure(text=f"{icon}{display_msg}", bg=bg_c, fg=fg_c)
 
@@ -2393,13 +3672,14 @@ class OmniApp:
         self._mark_queue()
         self._build_controls()
         self._update_tab_titles()
+        self._set_running_ui(self.running)
 
     def _filtered_samples(self) -> list[tuple[int, Sample]]:
         needle = self.v_filter.get().strip().lower()
         mode = self.v_status_filter.get()
         preds = {
             "All": lambda s: True,
-            "Pending": Sample.is_pending,
+            "Pending": lambda s: s.is_pending() or s.is_stopped(),
             "Running": Sample.is_running,
             "Complete": Sample.is_complete,
             "Failed": Sample.is_failed,
@@ -2462,28 +3742,62 @@ class OmniApp:
         for key, page in self.pages.items():
             if key == tab:
                 page.tkraise()
+        err_count = self.error_view.count() if hasattr(self, "error_view") else 0
         for key, btn in self.tab_buttons.items():
             active = key == tab
+            fg_color = "#FFFFFF" if active else ("#F87171" if key == "Errors" and err_count > 0 else MUTED)
             btn.configure(
                 bg=BLUE if active else "#0E131D",
-                fg="#FFFFFF" if active else MUTED,
+                fg=fg_color,
             )
         self._build_controls()
         if tab == "Queue":
             self._render_queue()
 
     def _update_tab_titles(self) -> None:
+        fn_count = self.func_view.count() if hasattr(self, "func_view") else 0
+        var_count = self.var_view.count() if hasattr(self, "var_view") else 0
+        err_count = self.error_view.count() if hasattr(self, "error_view") else 0
+        err_title = f"⚠ Errors ({err_count})" if err_count > 0 else "Errors (0)"
         tab_names = {
             "Queue": f"Sample Queue ({len(self.samples)})",
+            "Functions": f"Functions ({fn_count})",
+            "Variables": f"Variables ({var_count})",
+            "Errors": err_title,
             "Log": f"Activity Log ({len(self.logs)})",
             "IdaLog": f"ida.log ({len(self.ida_logs)})",
         }
         for key, title in tab_names.items():
             if key in self.tab_buttons:
                 self.tab_buttons[key].configure(text=title)
+                if key != self.console_tab:
+                    self.tab_buttons[key].configure(
+                        fg="#F87171" if key == "Errors" and err_count > 0 else MUTED
+                    )
 
     # ------------------------------------------------------------ batch run
     def on_run(self) -> None:
+        self._start_run(is_resume=False)
+
+    def on_resume(self) -> None:
+        self._start_run(is_resume=True)
+
+    def has_resumable_session(self) -> bool:
+        if getattr(self, "has_stopped_session", False):
+            return True
+        try:
+            out_root = Path(self.v_output.get().strip()) if self.v_output.get().strip() else None
+            if out_root and out_root.is_dir():
+                for s in self.samples:
+                    folder = out_root / sample_output_folder(s.path)
+                    idb_dir = folder / "IDB Files"
+                    if (idb_dir / "analyzed.i64").is_file() or (idb_dir / "analyzed.idb").is_file():
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _start_run(self, is_resume: bool = False) -> None:
         try:
             if self.running:
                 return
@@ -2513,15 +3827,30 @@ class OmniApp:
             except OSError:
                 pass
 
-            for sample in self.samples:
-                sample.status = "Ready"
-                sample.stage = "-"
-                sample.start_time = None
-                sample.elapsed_seconds = None
-            self.logs.clear()
-            self.ida_logs.clear()
-            self.log_view.clear()
-            self.ida_view.clear()
+            if not is_resume:
+                self.has_stopped_session = False
+                for sample in self.samples:
+                    sample.status = "Ready"
+                    sample.stage = "-"
+                    sample.start_time = None
+                    sample.elapsed_seconds = None
+                self.logs.clear()
+                self.ida_logs.clear()
+                self.log_view.clear()
+                self.ida_view.clear()
+                if hasattr(self, "func_view"):
+                    self.func_view.clear()
+                if hasattr(self, "var_view"):
+                    self.var_view.clear()
+                if hasattr(self, "error_view"):
+                    self.error_view.clear()
+                self._update_tab_titles()
+            else:
+                for sample in self.samples:
+                    if sample.status != "Complete":
+                        sample.status = "Resuming"
+                        sample.stage = "Resuming"
+
             self.progress_current, self.progress_total = 0, len(self.samples)
             self.running = True
             self._last_time_tick = time.time()
@@ -2529,12 +3858,16 @@ class OmniApp:
             if self.console_tab == "Queue":
                 self.show_tab("Log")
 
+            if is_resume:
+                self._add_logs(["⏯ Resuming OmniIDB session on saved database..."])
+
             self.cancel = runner.start(
                 RunRequest(
                     self.settings,
                     self.v_key.get(),
                     list(self.samples),
                     fallback_api_key=self.v_fallback_key.get(),
+                    is_resume=is_resume,
                 ),
                 self.events,
             )
@@ -2546,11 +3879,14 @@ class OmniApp:
     def on_cancel(self) -> None:
         if self.cancel:
             self.cancel.set()
-            self._add_logs(["⏹ Cancellation requested by user..."])
+            self._add_logs(["⏹ Stop requested by user. Instructing IDA to save database and exit gracefully..."])
 
     def _set_running_ui(self, running: bool) -> None:
         self.run_btn.configure_state("disabled" if running else "normal")
         self.cancel_btn.configure_state("normal" if running else "disabled")
+        can_resume = (not running) and self.has_resumable_session()
+        if hasattr(self, "resume_btn"):
+            self.resume_btn.configure_state("normal" if can_resume else "disabled")
 
     # ------------------------------------------------------------ event pump
     def _add_logs(self, lines: list[str]) -> None:
@@ -2623,10 +3959,39 @@ class OmniApp:
             self.progress_current, self.progress_total = d["current"], d["total"]
         elif kind == "log":
             new_logs.append(d["message"])
+            if d.get("level") == "error" and hasattr(self, "error_view"):
+                self.error_view.add_item({
+                    "time": time.strftime("%H:%M:%S"),
+                    "severity": "Error",
+                    "stage": d.get("stage", "Functions"),
+                    "sample": d.get("sample", ""),
+                    "message": d.get("message", ""),
+                    "details": d.get("traceback", ""),
+                })
+                self._update_tab_titles()
         elif kind == "ida_log_line":
             new_ida.append(d["message"])
         elif kind in ("omni_event", "genesect_event"):
             pass
+        elif kind == "rename_function":
+            if hasattr(self, "func_view"):
+                item_data = d.get("data") if isinstance(d.get("data"), dict) else d
+                self.func_view.add_item(item_data)
+                self._update_tab_titles()
+        elif kind == "rename_variable":
+            if hasattr(self, "var_view"):
+                item_data = d.get("data") if isinstance(d.get("data"), dict) else d
+                self.var_view.add_item(item_data)
+                self._update_tab_titles()
+        elif kind == "error_event":
+            if hasattr(self, "error_view"):
+                item_data = dict(d)
+                if not item_data.get("sample"):
+                    idx = item_data.get("index")
+                    if idx is not None and 0 <= idx < len(self.samples):
+                        item_data["sample"] = self.samples[idx].path.name
+                self.error_view.add_item(item_data)
+                self._update_tab_titles()
         elif kind == "provider_switch":
             src = d.get("provider_from") or "primary"
             dst = d.get("provider_to") or "fallback"
@@ -2637,20 +4002,56 @@ class OmniApp:
             if 0 <= idx < len(self.samples):
                 s = self.samples[idx]
                 if not s.is_skipped():
-                    s.status = "Complete" if d["ok"] else "Failed"
-                    s.stage = "Completed" if d["ok"] else "Failed"
+                    if d.get("stopped"):
+                        s.status = "Stopped (Saved)"
+                        s.stage = "Stopped"
+                    else:
+                        s.status = "Complete" if d["ok"] else "Failed"
+                        s.stage = "Completed" if d["ok"] else "Failed"
                 if s.start_time is not None:
                     s.elapsed_seconds = time.time() - s.start_time
                 self._mark_queue()
             self.progress_current = idx + 1
-            icon = "↷ " if (0 <= idx < len(self.samples) and self.samples[idx].is_skipped()) else ("✓ " if d["ok"] else "✗ ")
+            if d.get("stopped"):
+                icon = "⏸ "
+            elif 0 <= idx < len(self.samples) and self.samples[idx].is_skipped():
+                icon = "↷ "
+            else:
+                icon = "✓ " if d["ok"] else "✗ "
             new_logs.append(icon + d["message"])
+            if not d["ok"] and not d.get("stopped") and hasattr(self, "error_view"):
+                sample_name = self.samples[idx].path.name if (0 <= idx < len(self.samples)) else ""
+                exists = any(it.get("sample") == sample_name for it in self.error_view.items) if sample_name else False
+                if not exists:
+                    err_msg = d.get("message", "Sample analysis failed")
+                    self.error_view.add_item({
+                        "time": time.strftime("%H:%M:%S"),
+                        "severity": "Error",
+                        "stage": "Execution",
+                        "sample": sample_name or "Unknown",
+                        "message": err_msg,
+                        "details": "",
+                    })
+                    self._update_tab_titles()
+            res = d.get("result")
+            if res and isinstance(res, dict):
+                fn_items = (res.get("function_rename") or {}).get("items") or res.get("renamed_functions") or []
+                var_items = (res.get("variable_rename") or {}).get("items") or []
+                if fn_items and hasattr(self, "func_view") and self.func_view.count() == 0:
+                    self.func_view.set_items(fn_items)
+                if var_items and hasattr(self, "var_view") and self.var_view.count() == 0:
+                    self.var_view.set_items(var_items)
+                self._update_tab_titles()
         elif kind == "batch_finished":
             self.running = False
             self.cancel = None
+            if d.get("cancelled") or d.get("stopped"):
+                self.has_stopped_session = True
             self._set_running_ui(False)
-            word = "Cancelled" if d["cancelled"] else "Finished"
+            word = "Stopped" if d.get("cancelled") or d.get("stopped") else "Finished"
             new_logs.append(f"--- Batch {word}: {d['succeeded']} succeeded, {d['failed']} failed ---")
+            if d.get("can_resume") or self.has_resumable_session():
+                new_logs.append("💡 Click 'Resume' to continue the analysis from the saved IDB.")
             if hasattr(self, "cache_stats_lbl"):
                 try:
                     self.cache_stats_lbl.config(text=self._format_cache_stats())
@@ -2675,23 +4076,25 @@ class OmniApp:
                 self.test_btn.set_text("⚡ Test Connection")
 
             target = d.get("target", getattr(self, "testing_target", "main"))
+            is_ok = bool(d.get("ok"))
             if target == "fallback":
                 provider_name = self.v_fallback_provider.get()
                 if d.get("available_models") and hasattr(self, "fb_model_box"):
                     models = d["available_models"]
                     self.fb_model_box["values"] = models
-                    if d.get("resolved_model"):
-                        self.v_fallback_model.set(d["resolved_model"])
-                    elif models and (not self.v_fallback_model.get().strip() or self.v_fallback_model.get() in ("auto", "default")):
-                        self.v_fallback_model.set(models[0])
-                    self._pull_settings()
-                    try:
-                        self.settings.save()
-                    except OSError:
-                        pass
+                    if is_ok:
+                        if d.get("resolved_model"):
+                            self.v_fallback_model.set(d["resolved_model"])
+                        elif models and (not self.v_fallback_model.get().strip() or self.v_fallback_model.get().lower() in ("auto", "default", "local-model", "embeddings", "embedding")):
+                            self.v_fallback_model.set(models[0])
+                        self._pull_settings()
+                        try:
+                            self.settings.save()
+                        except OSError:
+                            pass
                     summary_models = ", ".join(models[:6]) + ("..." if len(models) > 6 else "")
                     new_logs.append(f"Available fallback models for {provider_name} ({len(models)}): {summary_models}")
-                elif d.get("resolved_model"):
+                elif is_ok and d.get("resolved_model"):
                     self.v_fallback_model.set(d["resolved_model"])
                     self._pull_settings()
                     try:
@@ -2705,18 +4108,19 @@ class OmniApp:
                 if d.get("available_models") and hasattr(self, "model_box"):
                     models = d["available_models"]
                     self.model_box["values"] = models
-                    if d.get("resolved_model"):
-                        self.v_model.set(d["resolved_model"])
-                    elif models and (not self.v_model.get().strip() or self.v_model.get() in ("auto", "default")):
-                        self.v_model.set(models[0])
-                    self._pull_settings()
-                    try:
-                        self.settings.save()
-                    except OSError:
-                        pass
+                    if is_ok:
+                        if d.get("resolved_model"):
+                            self.v_model.set(d["resolved_model"])
+                        elif models and (not self.v_model.get().strip() or self.v_model.get().lower() in ("auto", "default", "local-model", "embeddings", "embedding")):
+                            self.v_model.set(models[0])
+                        self._pull_settings()
+                        try:
+                            self.settings.save()
+                        except OSError:
+                            pass
                     summary_models = ", ".join(models[:6]) + ("..." if len(models) > 6 else "")
                     new_logs.append(f"Available model(s) for {provider_name} ({len(models)}): {summary_models}")
-                elif d.get("resolved_model"):
+                elif is_ok and d.get("resolved_model"):
                     self.v_model.set(d["resolved_model"])
                     self._pull_settings()
                     try:
@@ -2725,6 +4129,19 @@ class OmniApp:
                         pass
                 self._set_test_pill(d["ok"], d["message"])
                 new_logs.append(("✓ AI Connection: " if d["ok"] else "✗ AI Connection: ") + d["message"])
+
+            if not d.get("ok") and hasattr(self, "error_view"):
+                target = d.get("target", getattr(self, "testing_target", "main"))
+                p_name = self.v_fallback_provider.get() if target == "fallback" else self.v_provider.get()
+                self.error_view.add_item({
+                    "time": time.strftime("%H:%M:%S"),
+                    "severity": "Error",
+                    "stage": "Connection Test",
+                    "sample": p_name,
+                    "message": d.get("message", "Connection probe failed"),
+                    "details": f"Target: {target}",
+                })
+                self._update_tab_titles()
 
     def _set_sample(self, index: int, status: str, stage: Optional[str] = None) -> None:
         if 0 <= index < len(self.samples):

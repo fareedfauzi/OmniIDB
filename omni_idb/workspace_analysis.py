@@ -11,7 +11,13 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
-from .config import CLI_PROVIDERS, find_genesect_package_root
+from .config import (
+    CLI_PROVIDERS,
+    find_genesect_package_root,
+    normalize_anthropic_base_url,
+    openai_chat_endpoint,
+    provider_defaults,
+)
 from .usage import BudgetExceeded, UsageTracker
 
 
@@ -169,23 +175,26 @@ def _query_chatgpt_account(profile: dict, prompt: str, genesect_root: str, ida_p
 
 def _query_http(profile: dict, prompt: str) -> str:
     provider = str(profile.get("provider") or "OpenAI")
-    url = str(profile.get("api_url") or "").rstrip("/")
+    default_url, default_model, _default_executable = provider_defaults(provider)
+    url = str(profile.get("api_url") or default_url).rstrip("/")
     key = str(profile.get("api_key") or "")
-    model = str(profile.get("model") or "")
+    model = str(profile.get("model") or default_model)
     if provider == "Anthropic":
-        if url.endswith("/v1/messages"):
-            endpoint = url
-        elif url.endswith("/v1"):
-            endpoint = f"{url}/messages"
-        else:
-            endpoint = f"{url}/v1/messages"
+        endpoint = f"{normalize_anthropic_base_url(url)}/v1/messages"
         headers = {"Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01"}
-        body = {"model": model, "max_tokens": 8000, "messages": [{"role": "user", "content": SYSTEM_PROMPT + "\n\n" + prompt}]}
+        body = {
+            "model": model,
+            "max_tokens": 8000,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        }
     else:
-        endpoint = url if url.endswith("/chat/completions") else f"{url}/chat/completions"
+        endpoint = openai_chat_endpoint(url)
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
+        if provider == "GoogleGemini":
+            headers["x-goog-api-client"] = "omni-idb-oai/1.0"
         body = {"model": model, "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]}
         token_field = "max_completion_tokens" if any(name in model.lower() for name in ("o1", "o3", "gpt-5")) else "max_tokens"
         body[token_field] = 8000
@@ -195,7 +204,7 @@ def _query_http(profile: dict, prompt: str) -> str:
     if provider == "Anthropic":
         return "".join(str(item.get("text") or "") for item in payload.get("content", []) if isinstance(item, dict)).strip()
     message = (payload.get("choices") or [{}])[0].get("message") or {}
-    return str(message.get("content") or message.get("reasoning_content") or "").strip()
+    return str(message.get("content") or message.get("reasoning_content") or message.get("reasoning") or "").strip()
 
 
 def _query_profile(profile: dict, workspace: Path, context_prompt: str, genesect_root: str, ida_path: str) -> str:
@@ -513,7 +522,7 @@ def analyze_workspace(
     log = log_fn or (lambda _message: None)
     workspace = Path(workspace).resolve()
     chain = [dict(primary)]
-    if fallback and fallback.get("provider") and fallback.get("provider") != primary.get("provider"):
+    if fallback and fallback.get("provider") and dict(fallback) != dict(primary):
         chain.append(dict(fallback))
     tracker = UsageTracker(token_budget)
     context_prompt = build_workspace_context(workspace)

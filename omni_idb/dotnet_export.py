@@ -31,8 +31,10 @@ def is_ilspycmd_available() -> Optional[str]:
 
 
 def _tool_cache_dir() -> Path:
-    if os.name == "nt":
+    if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     return base / "OmniIDB" / "tools" / "ilspycmd" / ILSPYCMD_VERSION
@@ -398,12 +400,29 @@ def export_dotnet_workspace(
         "1. Inspect `catalog/imports.json` for external native capabilities and P/Invoke calls.",
         "2. Examine `catalog/strings.json` for command and control endpoints, file paths, or registry keys.",
         "3. Review `src/**/*.cs` and `cil/*.il` for the main execution logic and control flow.",
+        "",
+        "## Autonomous Analysis Pipeline",
+        "This workspace includes the complete two-phase analysis runbook and standalone compiler:",
+        "- `run_analysis.md` - Two-phase automated runbook (Pass 1 deep investigation -> `investigation.md`, Pass 2 technical research report -> `report.md`, decompiler navigation, and deliverables).",
+        "- `render_report.py` - Standalone CLI tool to compile `report.md` into styled `report.html` and vector `report.pdf`.",
+        "",
+        "To execute:",
+        "```bash",
+        "# Prompt your AI agent in this directory:",
+        "Read run_analysis.md and execute the entire analysis pipeline from Phase 1 through Phase 2.",
+        "```",
     ])
 
     agents_content = "\n".join(agents_md)
     (ws_dir / "AGENTS.md").write_text(agents_content, encoding="utf-8")
     (ws_dir / "CLAUDE.md").write_text(agents_content, encoding="utf-8")
     (ws_dir / "README.md").write_text(agents_content, encoding="utf-8")
+
+    try:
+        from .workspace_export import deploy_workspace_tools
+        deploy_workspace_tools(ws_dir)
+    except Exception as exc:
+        log(f"[WARN] Could not deploy workspace tools: {exc}")
 
     log(f"[OK] .NET AI Workspace exported successfully ({len(types_list)} types, {len(pinvokes)} P/Invokes, {len(clean_strings)} strings)")
 

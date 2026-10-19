@@ -181,17 +181,23 @@ def resolve_goresym(configured_path: str = "") -> str:
     is_win = sys.platform == "win32"
     names = ["GoReSym.exe", "goresym.exe"] if is_win else ["GoReSym", "goresym"]
 
-    # Search candidates: prioritize the permanent app folder / current directory over temp unpack dir
-    from .config import app_dir
+    from .config import app_dir, _config_dir
     search_dirs = [
         app_dir(),
         app_dir() / "tools",
         Path.cwd(),
         Path.cwd() / "tools",
+        _config_dir("OmniIDB") / "tools",
         Path.home() / ".local" / "bin",
         Path.home() / ".config" / "OmniIDB" / "tools",
-        Path(os.environ.get("APPDATA", "")) / "OmniIDB" / "tools" if is_win else Path("/usr/local/bin"),
+        Path.home() / ".local" / "share" / "OmniIDB" / "tools",
+        Path.home() / "Library" / "Application Support" / "OmniIDB" / "tools",
+        Path("/usr/local/bin"),
+        Path("/opt/homebrew/bin"),
+        Path("/usr/bin"),
     ]
+    if is_win and os.environ.get("APPDATA"):
+        search_dirs.append(Path(os.environ["APPDATA"]) / "OmniIDB" / "tools")
 
     for d in search_dirs:
         for name in names:

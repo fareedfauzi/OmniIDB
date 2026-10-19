@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -29,49 +29,51 @@ PROVIDERS = [
 
 SIGNED_IN_PROVIDERS = {"ChatGPTAccount", "ClaudeCode", "AntigravityCLI", "OpenCode", "CopilotCLI"}
 CLI_PROVIDERS = ("ClaudeCode", "AntigravityCLI", "OpenCode", "CopilotCLI")
-KEYLESS_PROVIDERS = {"Ollama", "LMStudio"}
+# These providers may run without a key. The UI still exposes the key field for
+# authenticated LM Studio or remote OpenAI-compatible deployments.
+KEYLESS_PROVIDERS = {"OpenAICompatible", "Ollama", "LMStudio"}
 
 # provider -> (api_url, model, executable)
 _PROVIDER_DEFAULTS = {
     "OpenAI": ("https://api.openai.com/v1", "gpt-5.1", ""),
-    "Anthropic": ("https://api.anthropic.com", "claude-sonnet-4-5", ""),
-    "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat", ""),
-    "GoogleGemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash", ""),
-    "OpenRouter": ("https://openrouter.ai/api/v1", "anthropic/claude-3.7-sonnet", ""),
-    "Groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", ""),
-    "Mistral": ("https://api.mistral.ai/v1", "codestral-latest", ""),
+    "Anthropic": ("https://api.anthropic.com", "claude-sonnet-4-6", ""),
+    "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-flash", ""),
+    "GoogleGemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.8-flash", ""),
+    "OpenRouter": ("https://openrouter.ai/api/v1", "openrouter/auto", ""),
+    "Groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b", ""),
+    "Mistral": ("https://api.mistral.ai/v1", "mistral-medium-3-5", ""),
     "OpenAICompatible": ("http://localhost:1234/v1", "local-model", ""),
     "Ollama": ("http://localhost:11434/v1", "llama3.2", ""),
     "LMStudio": ("http://localhost:1234/v1", "local-model", ""),
     "ChatGPTAccount": ("", "auto", ""),
     "ClaudeCode": ("", "default", "claude"),
-    "AntigravityCLI": ("", "default", "agy"),
+    "AntigravityCLI": ("", "gemini-3.8-flash-low", "agy"),
     "OpenCode": ("", "default", "opencode"),
     "CopilotCLI": ("", "default", "copilot"),
 }
 
 DEFAULT_PROVIDER_MODELS = {
     "OpenAI": ["gpt-5.1", "gpt-4o", "gpt-4o-mini", "o3-mini", "o1"],
-    "Anthropic": ["claude-sonnet-4-5", "claude-3-7-sonnet-latest", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"],
-    "DeepSeek": ["deepseek-chat", "deepseek-reasoner"],
-    "GoogleGemini": ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash"],
-    "OpenRouter": ["anthropic/claude-3.7-sonnet", "deepseek/deepseek-r1", "openai/gpt-4o", "meta-llama/llama-3.3-70b-instruct", "qwen/qwen-2.5-coder-32b-instruct"],
-    "Groq": ["llama-3.3-70b-versatile", "deepseek-r1-distill-llama-70b", "qwen-2.5-coder-32b", "llama-3.1-8b-instant"],
-    "Mistral": ["codestral-latest", "mistral-large-latest", "mistral-small-latest", "ministral-8b-latest"],
+    "Anthropic": ["claude-sonnet-5", "claude-sonnet-4-6", "claude-opus-5", "claude-haiku-4-5-20251001"],
+    "DeepSeek": ["deepseek-flash", "deepseek-v4-pro"],
+    "GoogleGemini": ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-pro"],
+    "OpenRouter": ["openrouter/auto", "anthropic/claude-sonnet-4.6", "openai/gpt-5.1", "google/gemini-3.8-flash"],
+    "Groq": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
+    "Mistral": ["mistral-medium-3-5", "mistral-small-4", "mistral-large-3", "codestral-latest"],
     "OpenAICompatible": ["local-model"],
     "Ollama": ["llama3.2", "llama3.1", "qwen2.5-coder", "deepseek-r1"],
     "LMStudio": ["local-model"],
     "ChatGPTAccount": ["auto", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-4o"],
-    "ClaudeCode": ["default", "claude-3-7-sonnet", "claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus"],
+    "ClaudeCode": ["default", "sonnet", "opus", "haiku", "claude-sonnet-4-6", "claude-opus-5"],
     "AntigravityCLI": [
-        "default",
-        "gemini-4-argon-medium",
-        "gemini-4-argon-high",
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash-medium",
         "gemini-3.8-flash-high",
-        "claude-sonnet-5-5-high",
-        "gpt-oss-120b-medium",
+        "claude-sonnet-5-5-low",
+        "gemini-4-argon-low",
+        "default",
     ],
-    "OpenCode": ["default", "openai/gpt-4o", "anthropic/claude-3-5-sonnet"],
+    "OpenCode": ["default", "openai/gpt-5.1", "anthropic/claude-sonnet-4-6", "google/gemini-3.8-flash"],
     "CopilotCLI": ["default", "gpt-4o", "claude-3.5-sonnet", "o1"],
 }
 
@@ -82,6 +84,44 @@ def provider_defaults(provider: str) -> tuple[str, str, str]:
 
 def default_models_for_provider(provider: str) -> list[str]:
     return list(DEFAULT_PROVIDER_MODELS.get(provider, []))
+
+
+def normalize_openai_base_url(url: str) -> str:
+    """Normalize an OpenAI-compatible base URL supplied as a base or endpoint."""
+    from urllib.parse import urlparse
+
+    value = str(url or "").strip().rstrip("/")
+    lowered = value.lower()
+    for suffix in ("/chat/completions", "/completions", "/responses", "/models"):
+        if lowered.endswith(suffix):
+            value = value[:-len(suffix)].rstrip("/")
+            break
+    parsed = urlparse(value)
+    if parsed.scheme in ("http", "https") and parsed.path in ("", "/"):
+        value += "/v1"
+    return value
+
+
+def openai_chat_endpoint(url: str) -> str:
+    base = normalize_openai_base_url(url)
+    return f"{base}/chat/completions"
+
+
+def openai_model_endpoints(url: str) -> list[str]:
+    base = normalize_openai_base_url(url)
+    endpoints = [f"{base}/models"]
+    if base and not base.lower().endswith(("/v1", "/openai")):
+        endpoints.append(f"{base}/v1/models")
+    return endpoints
+
+
+def normalize_anthropic_base_url(url: str) -> str:
+    value = str(url or "").strip().rstrip("/")
+    lowered = value.lower()
+    for suffix in ("/v1/messages", "/v1/models", "/v1"):
+        if lowered.endswith(suffix):
+            return value[:-len(suffix)].rstrip("/")
+    return value
 
 
 def is_signed_in_provider(provider: str) -> bool:
@@ -122,6 +162,16 @@ def _config_dir(app: str) -> Path:
     return base / app
 
 
+def _cache_dir(app: str) -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / app
+
+
 def settings_path() -> Path:
     path = _config_dir("OmniIDB") / "settings.json"
     if path.is_file():
@@ -131,7 +181,25 @@ def settings_path() -> Path:
 
 
 def cache_path() -> Path:
-    return _config_dir("OmniIDB") / "rename_cache.sqlite3"
+    primary = _config_dir("OmniIDB") / "rename_cache.sqlite3"
+    if primary.is_file():
+        return primary
+    # Check fallback/legacy locations (e.g. LocalAppData on Windows, or older cache dir)
+    candidates = [
+        _cache_dir("OmniIDB") / "rename_cache.sqlite3",
+        _config_dir("Genesector") / "rename_cache.sqlite3",
+        _cache_dir("Genesector") / "rename_cache.sqlite3",
+    ]
+    if sys.platform == "win32":
+        for var in ("LOCALAPPDATA", "APPDATA"):
+            val = os.environ.get(var)
+            if val:
+                candidates.append(Path(val) / "OmniIDB" / "rename_cache.sqlite3")
+                candidates.append(Path(val) / "Genesector" / "rename_cache.sqlite3")
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return primary
 
 
 def path_text(path) -> str:
@@ -171,10 +239,44 @@ def find_genesect_package_root(*hints: Path | str) -> Optional[Path]:
         p = Path(text)
         candidates += [p, p / "plugins", p.parent / "plugins"]
     candidates += [project_root(), project_root().parent]
-    for name in ("IDA Professional", "IDA Pro", "IDA Home", "IDA Free"):
-        for version in ("9.3", "9.2", "9.1", "9.0", "8.4", "8.3", "8.2", "8.1", "8.0", "7.7", "7.6", "7.5"):
-            candidates.append(Path(rf"C:\Program Files\{name} {version}\plugins"))
-            candidates.append(Path(rf"C:\Program Files (x86)\{name} {version}\plugins"))
+
+    # Standard per-user IDA plugin directories
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "Hex-Rays" / "IDA Pro" / "plugins")
+    elif sys.platform == "darwin":
+        candidates.append(Path.home() / "Library" / "Application Support" / "Hex-Rays" / "IDA Pro" / "plugins")
+        candidates.append(Path.home() / ".idapro" / "plugins")
+    else:
+        candidates.append(Path.home() / ".idapro" / "plugins")
+        candidates.append(Path.home() / ".local" / "share" / "Hex-Rays" / "IDA Pro" / "plugins")
+
+    ida_names = ("IDA Professional", "IDA Pro", "IDA Home", "IDA Free", "IDA")
+    ida_versions = ("9.3", "9.2", "9.1", "9.0", "8.4", "8.3", "8.2", "8.1", "8.0", "7.7", "7.6", "7.5", "7.0")
+
+    if sys.platform == "win32":
+        for name in ida_names:
+            for version in ida_versions:
+                candidates.append(Path(rf"C:\Program Files\{name} {version}\plugins"))
+                candidates.append(Path(rf"C:\Program Files (x86)\{name} {version}\plugins"))
+                candidates.append(Path(rf"C:\Program Files\{name}\plugins"))
+    elif sys.platform == "darwin":
+        mac_bases = [Path("/Applications"), Path.home() / "Applications"]
+        for base in mac_bases:
+            for version in ida_versions:
+                for name in ida_names:
+                    candidates.append(base / f"{name} {version}" / "plugins")
+            for name in ida_names:
+                candidates.append(base / name / "plugins")
+    else:
+        linux_bases = [Path("/opt"), Path.home(), Path.home() / ".idapro", Path("/usr/local"), Path("/usr/share")]
+        for base in linux_bases:
+            for version in ida_versions:
+                for prefix in ("idapro-", "idapro", "ida-", "ida"):
+                    candidates.append(base / f"{prefix}{version}" / "plugins")
+            candidates.append(base / "plugins")
+
     for candidate in candidates:
         if (candidate / "genesect" / "__init__.py").is_file():
             return candidate
@@ -187,34 +289,102 @@ def detect_engine_root() -> Optional[Path]:
         for directory in [start, *list(start.parents)[:8]]:
             if runner_script(directory).is_file():
                 return directory
-    for version in ("9.3", "9.2", "9.1", "9.0", "8.4", "8.3"):
-        plugin = Path(rf"C:\Program Files\IDA Professional {version}\plugins")
-        if (plugin / "genesect").is_dir():
-            return plugin
+
+    # Also search IDA Pro plugins directories where genesect may be installed
+    ida_names = ("IDA Professional", "IDA Pro")
+    ida_versions = ("9.3", "9.2", "9.1", "9.0", "8.4", "8.3")
+    if sys.platform == "win32":
+        for version in ida_versions:
+            plugin = Path(rf"C:\Program Files\IDA Professional {version}\plugins")
+            if (plugin / "genesect").is_dir():
+                return plugin
+    elif sys.platform == "darwin":
+        for version in ida_versions:
+            for name in ida_names:
+                plugin = Path(f"/Applications/{name} {version}/plugins")
+                if (plugin / "genesect").is_dir():
+                    return plugin
+    else:
+        for version in ida_versions:
+            for prefix in ("idapro-", "idapro", "ida-"):
+                plugin = Path(f"/opt/{prefix}{version}/plugins")
+                if (plugin / "genesect").is_dir():
+                    return plugin
     return None
 
 
 def detect_ida() -> Optional[Path]:
     import shutil
-    for exe in ("ida.exe", "ida64.exe", "ida", "ida64"):
+
+    # 1. Search PATH for any standard IDA Pro / IDAT headless binary
+    for exe in ("idat64", "idat64.exe", "ida64", "ida64.exe", "idat", "idat.exe", "ida", "ida.exe"):
         found = shutil.which(exe)
         if found and Path(found).is_file():
             return Path(found)
 
     names = ["IDA Professional", "IDA Pro", "IDA Home", "IDA Free", "IDA"]
     versions = ("9.3", "9.2", "9.1", "9.0", "8.4", "8.3", "8.2", "8.1", "8.0", "7.7", "7.6", "7.5", "7.0")
-    for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
-        for version in versions:
+
+    if sys.platform == "win32":
+        for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
+            for version in versions:
+                for name in names:
+                    for exe in ("idat64.exe", "ida64.exe", "idat.exe", "ida.exe"):
+                        candidate = Path(rf"{base}\{name} {version}\{exe}")
+                        if candidate.is_file():
+                            return candidate
             for name in names:
-                for exe in ("ida.exe", "ida64.exe"):
-                    candidate = Path(rf"{base}\{name} {version}\{exe}")
+                for exe in ("idat64.exe", "ida64.exe", "idat.exe", "ida.exe"):
+                    candidate = Path(rf"{base}\{name}\{exe}")
                     if candidate.is_file():
                         return candidate
-        for name in names:
-            for exe in ("ida.exe", "ida64.exe"):
-                candidate = Path(rf"{base}\{name}\{exe}")
-                if candidate.is_file():
-                    return candidate
+    elif sys.platform == "darwin":
+        mac_bases = [Path("/Applications"), Path.home() / "Applications"]
+        for base in mac_bases:
+            for version in versions:
+                for name in names:
+                    folder = base / f"{name} {version}"
+                    if folder.is_dir():
+                        for app_name in ("ida64.app", "ida.app", "idat64.app", "idat.app"):
+                            cand = folder / app_name / "Contents" / "MacOS" / app_name.replace(".app", "")
+                            if cand.is_file():
+                                return cand
+                        for exe in ("idat64", "ida64", "idat", "ida"):
+                            cand = folder / exe
+                            if cand.is_file():
+                                return cand
+            for name in names:
+                folder = base / name
+                if folder.is_dir():
+                    for app_name in ("ida64.app", "ida.app"):
+                        cand = folder / app_name / "Contents" / "MacOS" / app_name.replace(".app", "")
+                        if cand.is_file():
+                            return cand
+                    for exe in ("idat64", "ida64", "idat", "ida"):
+                        cand = folder / exe
+                        if cand.is_file():
+                            return cand
+        for p in (Path("/usr/local/bin/ida64"), Path("/usr/local/bin/idat64"), Path("/opt/homebrew/bin/ida64")):
+            if p.is_file():
+                return p
+    else:
+        linux_bases = [Path("/opt"), Path.home(), Path.home() / ".idapro", Path("/usr/local"), Path("/usr/share")]
+        for base in linux_bases:
+            for version in versions:
+                for prefix in ("idapro-", "idapro", "ida-", "ida"):
+                    folder = base / f"{prefix}{version}"
+                    if folder.is_dir():
+                        for exe in ("idat64", "ida64", "idat", "ida"):
+                            cand = folder / exe
+                            if cand.is_file():
+                                return cand
+            for exe in ("idat64", "ida64", "idat", "ida"):
+                cand = base / exe
+                if cand.is_file():
+                    return cand
+        for p in (Path("/usr/local/bin/idat64"), Path("/usr/local/bin/ida64"), Path("/usr/bin/idat64"), Path("/usr/bin/ida64")):
+            if p.is_file():
+                return p
     return None
 
 
@@ -228,10 +398,10 @@ class AppSettings:
     api_url: str = "https://api.openai.com/v1"
     model: str = "gpt-5.1"
     executable: str = ""
-    rename_functions: bool = True
+    rename_functions: bool = False
     rename_functions_with_address: bool = False
-    rename_variables: bool = True
-    generate_workspace: bool = False
+    rename_variables: bool = False
+    generate_workspace: bool = True
     analyze_workspace: bool = False
     autonomous_investigation: bool = False
     dotnet_mode: str = "skip"  # "skip" | "decompile"
@@ -241,7 +411,7 @@ class AppSettings:
     batch_size: int = 15
     workers: int = 3
     low_score_rescan: bool = False
-    cooldown_seconds: int = 0
+    cooldown_seconds: int = 1
     use_rename_cache: bool = True
     token_budget: int = 0
     fallback_enabled: bool = False
@@ -249,6 +419,7 @@ class AppSettings:
     fallback_api_url: str = "http://localhost:11434/v1"
     fallback_model: str = "llama3.2"
     fallback_executable: str = ""
+    api_keys: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def default(cls) -> "AppSettings":
@@ -267,15 +438,40 @@ class AppSettings:
             return settings
         known = {f.name: f for f in fields(cls)}
         for key, value in data.items():
-            if key in known and isinstance(value, type(getattr(settings, key))):
-                setattr(settings, key, value)
+            if key in known:
+                if key == "api_keys" and isinstance(value, dict):
+                    setattr(settings, key, {str(k): str(v) for k, v in value.items()})
+                elif isinstance(value, type(getattr(settings, key))):
+                    setattr(settings, key, value)
+        # Migrate single legacy api_key if present
+        if "api_key" in data and isinstance(data["api_key"], str) and data["api_key"].strip():
+            if settings.provider not in settings.api_keys:
+                settings.api_keys[settings.provider] = data["api_key"].strip()
         return settings
+
+    def get_api_key(self, provider: str) -> str:
+        if not hasattr(self, "api_keys") or not isinstance(self.api_keys, dict):
+            self.api_keys = {}
+        return self.api_keys.get(provider, "")
+
+    def set_api_key(self, provider: str, key: str) -> None:
+        if not hasattr(self, "api_keys") or not isinstance(self.api_keys, dict):
+            self.api_keys = {}
+        cleaned = key.strip()
+        if cleaned:
+            self.api_keys[provider] = cleaned
+        elif provider in self.api_keys:
+            del self.api_keys[provider]
 
     def save(self) -> None:
         path = _config_dir("OmniIDB") / "settings.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        # The API key is intentionally not part of this dataclass.
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        try:
+            if sys.platform != "win32":
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
 
     def apply_provider_defaults(self) -> None:
         self.api_url, self.model, self.executable = provider_defaults(self.provider)

@@ -351,8 +351,8 @@ def assemble_model(
         apis = kf.get("api_calls", [])
         
         apis_lower = [str(a).lower() for a in apis]
-        is_mal = any(any(m in a for m in ("virtualallocex", "writeprocessmemory", "createremotethread", "queueuserapc", "setthreadcontext", "ptrace", "adjusttokenprivileges", "getasynckeystate", "setwindowshookex")) for a in apis_lower)
-        is_susp = any(any(m in a for m in ("virtualalloc", "virtualprotect", "loadlibrary", "getprocaddress", "crypt", "aes", "socket", "connect", "internetopen", "regsetvalue", "createservice", "isdebuggerpresent", "ntqueryinformationprocess")) for a in apis_lower)
+        is_mal = any(any(m in a for m in ("virtualallocex", "writeprocessmemory", "createremotethread", "queueuserapc", "setthreadcontext", "ptrace", "adjusttokenprivileges", "getasynckeystate", "setwindowshookex", "task_for_pid", "mach_vm_write", "process_vm_writev", "memfd_create")) for a in apis_lower)
+        is_susp = any(any(m in a for m in ("virtualalloc", "virtualprotect", "loadlibrary", "getprocaddress", "crypt", "aes", "socket", "connect", "internetopen", "regsetvalue", "createservice", "isdebuggerpresent", "ntqueryinformationprocess", "mmap", "mprotect", "dlsym", "dlopen", "sysctl")) for a in apis_lower)
         verdict = "Malicious" if is_mal else ("Suspicious" if is_susp else "Core Functionality")
         
         guidance_parts = []
@@ -462,6 +462,8 @@ def yara_rule(model: Dict[str, Any]) -> str:
         cond.append("uint16(0) == 0x5A4D")
     elif "elf" in file_type:
         cond.append("uint32(0) == 0x464C457F")
+    elif "mach" in file_type:
+        cond.append("(uint32(0) == 0xFEEDFACE or uint32(0) == 0xFEEDFACF or uint32(0) == 0xCEFAEDFE or uint32(0) == 0xCFFAEDFE or uint32(0) == 0xCAFEBABE or uint32(0) == 0xBEBAFECA)")
     size = int(sample.get("size") or 0)
     if size:
         cond.append("filesize < %d" % max(50000, size * 2))
