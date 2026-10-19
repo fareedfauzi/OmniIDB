@@ -53,8 +53,18 @@ def build_workspace_context(workspace: Path, maximum_chars: int = 180_000) -> st
         workspace / "catalog" / "assembly.json",
         workspace / "catalog" / "triage_indicators.json",
         workspace / "catalog" / "imports.json",
+        workspace / "catalog" / "globals.json",
         workspace / "catalog" / "strings.json",
         workspace / "catalog" / "types.json",
+        workspace / "catalog" / "entrypoints.json",
+        workspace / "catalog" / "analysis_gaps.json",
+        workspace / "catalog" / "cfg.json",
+        workspace / "catalog" / "function_variables.json",
+        workspace / "catalog" / "data_objects.json",
+        workspace / "catalog" / "switches.json",
+        workspace / "catalog" / "pointer_tables.json",
+        workspace / "catalog" / "xrefs.json",
+        workspace / "catalog" / "source_map.json",
     ]
     source_files = sorted((workspace / "src").rglob("*.cs")) if (workspace / "src").is_dir() else []
     if not source_files:

@@ -508,7 +508,183 @@ Do not modify executable bytes or control flow.
 
 ---
 
-### 10. Report Deliverables
+# 10. Mandatory Reverse Engineering and IDB Investigation Guide
+
+At the end of the report, include a dedicated section that helps the analyst continue investigating the sample.
+
+This section is an operational reverse engineering guide, not another summary of malware behaviour.
+
+It must identify the most important routines, explain why they matter, and provide concrete instructions for manual analysis.
+
+## For Native Binaries: IDA Pro
+
+Use the heading:
+
+`## Key Functions for Reverse Engineering & IDB Navigation`
+
+Include a Markdown table:
+
+| Address | Suggested Function Name | Original Name | Classification | Priority | What It Does | What to Inspect in IDB |
+|---|---|---|---|---|---|---|
+
+### Classification
+
+Use:
+
+- **Malicious:** Implements a clearly identified malicious operation.
+- **Suspicious:** Contains potentially relevant behaviour requiring further investigation.
+- **Core Functionality:** Supports important execution logic without being inherently malicious.
+
+Do not classify standard library routines as suspicious merely because malware calls them.
+
+### Priority
+
+Use:
+
+- **High:** Essential to understanding execution, payloads, communication, or major capabilities.
+- **Medium:** Supports important mechanisms or unresolved findings.
+- **Low:** Useful supporting logic but not essential to the initial investigation.
+
+### Navigation Guidance
+
+For each important function:
+
+- Explain its actual operational purpose.
+- Identify relevant callers and callees.
+- Highlight significant API calls and parameters.
+- Identify important branches, loops, and conditions.
+- Describe relevant buffers, structures, and data transformations.
+- Identify strings, constants, and cross-references worth examining.
+- Highlight suspicious return-value handling or implementation mistakes.
+- Recommend specific manual investigation steps.
+
+Use practical IDA terminology when relevant:
+
+- F5: Inspect decompiled pseudocode.
+- X: Examine cross-references.
+- G: Navigate to a specific address.
+- Strings: Locate configuration values and important references.
+- Imports: Identify relevant external API usage.
+- Graph View: Inspect complex control flow.
+- Hex View: Examine raw data and encoded payloads.
+
+Avoid generic guidance such as "inspect this suspicious function."
+
+Instead, provide actionable instructions.
+
+Example:
+
+"Open 0x140001230 and inspect the loop that transforms the embedded byte array. Trace the destination buffer and identify where the decoded output is used. Check callers for the decryption key and examine cross-references to the resulting buffer."
+
+### Function Selection
+
+- Prioritize malware-specific routines.
+- Include important unnamed `sub_*` functions.
+- Include existing named routines when their behaviour is significant.
+- Exclude ordinary CRT, STL, compiler-generated, and unrelated library functions.
+- Do not force a fixed number of functions into the table.
+- Preserve meaningful original names when renaming offers no improvement.
+
+## For Managed .NET Assemblies: dnSpy / ILSpy
+
+Use the heading:
+
+`## Key Methods for Decompiler Navigation (dnSpy / ILSpy)`
+
+Include:
+
+| Type / Namespace | Method Name | Location / Token | Classification | Priority | What It Does | What to Inspect |
+|---|---|---|---|---|---|---|
+
+Provide guidance on:
+
+- Method call relationships.
+- P/Invoke declarations.
+- Reflection and dynamic loading.
+- Assembly resolution.
+- Resource extraction.
+- String and configuration decryption.
+- Delegates and callbacks.
+- Network communication.
+- Process execution.
+- Obfuscation and control-flow transformations.
+
+Use real method names, tokens, and locations from the available artifacts.
+
+Do not invent metadata tokens or method relationships.
+
+---
+
+# 11. Mandatory Further Investigation Priorities
+
+After the navigation table, include:
+
+`## Recommended Next Steps in Reverse Engineering`
+
+Identify unresolved questions and worthwhile manual investigations.
+
+Prioritize findings that could materially change the understanding of the malware.
+
+For each investigation, provide:
+
+1. **Question:** What remains unknown?
+2. **Where to investigate:** Relevant function address, method, string, data structure, or artifact.
+3. **What to inspect:** Specific code, control flow, data, API parameters, or cross-references.
+4. **Expected outcome:** What the investigation could establish.
+5. **Priority:** High, Medium, or Low.
+
+Example:
+
+**High — Determine the decrypted payload's execution path**
+
+- Location: `sub_140002310`
+- Inspect: Destination buffer, memory protection changes, and indirect call targets.
+- Objective: Determine whether the decoded data is mapped as a PE, executed as shellcode, or passed to another loader stage.
+
+Do not invent unresolved questions merely to populate this section.
+
+If the available artifacts establish the behaviour sufficiently, state that no further investigation is necessary for that particular mechanism.
+
+---
+
+# 12. YARA Rule Generation & Detection Engineering
+
+Generate high-confidence, production-ready YARA detection rules based on verified technical findings.
+
+Save the standalone rules file to:
+`./detection_rules.yar`
+
+Additionally, embed the complete YARA rule block into `report.md` under: `## Detection Engineering & YARA Rules`
+
+## Detection Standards
+- **Target Unique Implementation Logic:** Base signatures on custom encryption/decryption loops, distinctive C2 protocol framing, unique command dispatch tables, or bespoke data structures.
+- **Resilient Byte Sequences:** When defining hex patterns (`$code*`), wildcard volatile registers, relative offsets (`call`/`jmp`), and memory addresses using `??` (e.g., `{ 8B 45 ?? 33 C9 E8 ?? ?? ?? ?? }`).
+- **Strict False Positive Prevention:**
+  - Never match compiler prologues, CRT startup routines, standard library functions, or runtime wrappers (Go, Rust, .NET BCL).
+  - Never rely solely on generic APIs (e.g., `VirtualAlloc`, `WriteProcessMemory`), standard DLL names, or common strings.
+- **Appropriate String Modifiers:** Use `ascii`, `wide`, or `xor` where appropriate. Use `nocase` sparingly to preserve scanning performance.
+
+## Required Rule Structure (YARA 4.x / 5.x)
+Every generated rule must include:
+1. **Descriptive Rule Name:** Follow standard naming conventions (e.g., `rule mal_win_<family>_<stage>`).
+2. **Metadata Block:** Include `author`, `description`, `date`, `sample_sha256`, `threat_level`, and `reference`.
+3. **Strings Block (`strings:`):** Define a mix of unique code bytes (`$code*`) and distinctive strings (`$str*`).
+4. **Condition Block (`condition:`):**
+   - **File Header Check:** Constrain the target format:
+     - PE: `uint16(0) == 0x5A4D and uint32(uint32(0x3C)) == 0x00004550`
+     - ELF: `uint32(0) == 0x464C457F`
+     - Mach-O: `uint32(0) == 0xFEEDFACE or uint32(0) == 0xFEEDFACF`
+   - **Size Guardrail:** Include a reasonable upper bound (e.g., `filesize < 10MB`).
+   - **Multi-Factor Logic:** Avoid single-point failure (e.g., `($magic and $filesize) and ($code_decrypt or all of ($str_c2*))`).
+
+## Deliverable Requirements
+1. Verify that the rule syntax is valid and free of typos, missing braces, or unbalanced conditions.
+2. Ensure `./detection_rules.yar` is created and non-empty.
+3. In `report.md`, provide a brief technical rationale explaining which specific malware mechanism each string or byte pattern detects.
+
+---
+
+### 13. Report Deliverables
 
 Generate the following files inside the workspace (`./`):
 
@@ -586,3 +762,4 @@ Before finalizing, review the report for technical accuracy, completeness, and r
 Correct identified problems before finalizing.
 
 **Final instruction: Do not optimize for report length, number of findings, or number of renamed functions. Optimize for technical accuracy, analytical completeness, professional research writing, and meaningful IDB enrichment.**
+

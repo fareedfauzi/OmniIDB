@@ -38,7 +38,7 @@ Batch reverse engineering and IDA database enrichment using AI.
 - **Batch processing**: Queue up a single binary or entire directories of malware samples.
 - **Saves two IDBs**: Keeps `original.i64` (captured right after IDA finishes initial auto-analysis) and `analyzed.i64` (after functions and variables are renamed).
 - **Function & variable renaming**: Uses bottom-up call graph analysis so leaf functions get renamed first, giving better context when naming parent functions.
-- **Offline AI workspace export**: Dumps decompiled C functions (`decompiled/*.c`), strings, imports, and an `AGENTS.md` file you can feed to external coding agents.
+- **Offline AI workspace export**: Dumps decompiled C functions, globals, Local Types, exact xrefs, CFGs, stack variables, entrypoints, bounded data payloads, indirect-flow metadata, source mappings, and an `AGENTS.md` file for external coding agents.
 - **AI workspace report (CLI agents)**: Lets agents like Antigravity CLI, Claude Code, or OpenCode review the exported workspace and write a technical malware report.
 - **Autonomous multi-turn investigation**: An interactive loop where the LLM queries IDA, checks cross-references, and generates Markdown, HTML, and PDF reports.
 - **Provider fallback**: Auto-switches to a secondary provider (e.g. local Ollama) if your primary API runs out of tokens or hits rate limits.
@@ -225,6 +225,8 @@ The workspace exporter redesign organizes binary decompilations into an offline 
 - **Behavioral modules**: Functions are classified into `00_entry_runtime` through `99_utilities` based on the APIs they call, strings referenced, crypto constants (AES S-box, MD5/SHA state, RC4 loops), stack buffer sizes, and call-graph neighbor propagation.
 - **Three files per function**: Each routine has `<stem>.c` (Hex-Rays decompilation with `#include "headers/omni_types.h"`), `<stem>.asm` (IDA disassembly), and `<stem>.brief.md` (quick facts, callers/callees, triage indicators).
 - **Consolidated headers**: Local types recovered from IDA's Type Info Library are exported to `headers/omni_types.h` alongside editor-friendly shims for Hex-Rays annotations (`__usercall`, `__int64`, etc.).
+- **Global-variable catalog**: `globals.tsv` and `catalog/globals.json` capture named globals and unnamed data referenced by code, including types, sizes, initial values, aliases, read/write references, and referencing functions.
+- **Advanced IDB evidence**: `catalog/types.json`, `xrefs.tsv`, per-function CFG/variable JSON, entrypoints, selective global-data blobs, fixups, switches, pointer tables, analysis gaps, and source/symbol provenance preserve the database knowledge needed for deeper offline analysis.
 - **Triage catalog**: `catalog/triage_indicators.json` ranks suspicious routines by weighted heuristics (dynamic API resolution, process injection, crypto constants, command lines) to prioritize where to start reading.
 
 ---
