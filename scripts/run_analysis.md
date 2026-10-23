@@ -4,6 +4,21 @@ You are a senior malware reverse engineer and threat intelligence researcher spe
 
 You must perform a complete, end-to-end investigation of the current workspace directory (`./`) by executing **Phase 1 (Pass 1)** and **Phase 2 (Pass 2)** sequentially in a single automated run without stopping between phases.
 
+## MANDATORY STARTUP AND INSTRUCTION ORDER
+
+Before performing any analysis or running any workspace tool:
+
+1. Read `./AGENTS.md` first. Treat it as the workspace entry point and follow all safety, scope, and tool-use instructions it contains.
+2. Then read this `./run_analysis.md` file completely, from beginning to end, before starting Phase 1.
+3. Treat `./run_analysis.md` as the authoritative analysis and reporting workflow. If another workspace guidance file summarizes this workflow, the complete requirements in `run_analysis.md` still apply.
+4. Only after both files have been read may you begin the two-phase pipeline below.
+
+Use this exact instruction when launching or handing the workspace to an autonomous Codex, Antigravity, or other AI agent:
+
+> Read `AGENTS.md` first. Then read `run_analysis.md` in full and execute its workflow. Do not execute recovered payloads.
+
+Apply the same startup order recursively to every recovered child-stage AI workspace: enter the child workspace, read its `AGENTS.md` first, read its `run_analysis.md` completely, and only then analyze that stage. Never execute the original sample or any recovered payload.
+
 ---
 
 ## EXECUTION DIRECTIVE: TWO-PHASE PIPELINE
@@ -57,7 +72,73 @@ Investigate relevant areas such as execution, payload loading, process injection
 
 For packed, encrypted, virtualized, or multi-stage samples, trace the observable loading and execution chain as far as the available evidence permits.
 
+#### Recovered Payload Artifacts
+
+When the available code and artifacts allow you to decrypt, decode, decompress, reconstruct, or otherwise recover a next-stage payload, you **MUST dump the recovered bytes to disk**. Create `./recovered_payloads/` and save each artifact with a descriptive name and the most accurate extension available (for example `.exe`, `.dll`, `.sys`, `.bin`, or `.shellcode`). Preserve the exact recovered bytes; do not merely describe or paste them into the investigation notes. Do not execute the recovered payload. Record the output path, recovery method, source location, detected format (if known), size, and hash in `./investigation.md`. If recovery cannot be completed from the available static artifacts, state the limitation without fabricating an output.
+
+##### Recovery Techniques and Validation
+
+- Identify likely payload buffers and transformations from the code, including Base64/hex decoding, XOR or arithmetic transforms, RC4/AES-like routines, serialization, and compression formats such as ZIP, GZip, Deflate, LZMA, or custom wrappers.
+- Reproduce the demonstrated transformation in a small, standalone extraction script instead of manually transcribing bytes. Save that script beside the output in `./recovered_payloads/` when practical, so the recovery is reproducible.
+- Use only static or controlled byte-processing methods. Never execute, load, inject, or launch a recovered payload to determine its contents.
+- Validate every layer after recovery: check signatures/magic bytes, parsable container structure, likely PE architecture and headers where applicable, byte count, entropy, and SHA-256. Retain meaningful intermediate layers when a multi-stage chain is recovered.
+- Name artifacts to indicate their order and type, such as `stage_2_decrypted.dll`, `stage_3_unpacked.bin`, or `stage_2_shellcode.bin`. Do not assign a PE extension unless the bytes validate as that format.
+- If a key, seed, runtime value, or unavailable memory buffer prevents recovery, record the exact blocker, the input artifact, and the attempted evidence-based method in `./investigation.md`; do not guess keys or manufacture a payload.
+
+##### Recursive Stage Workspaces
+
+For every recovered next-stage artifact, create a dedicated child AI workspace before analysing that artifact. Run the standalone workspace dumper included in this directory:
+
+```bash
+python dump_ai_workspace.py ./recovered_payloads/<recovered-file> --output ./recovered_payloads/<stage-name>_ai_workspace
+```
+
+For a native PE, ELF, or Mach-O binary, use the configured IDA batch executable so the child workspace includes the complete IDA/Hex-Rays export rather than only static fallback artifacts:
+
+```bash
+python find_ida.py
+python dump_ai_workspace.py ./recovered_payloads/<recovered-file>.exe --output ./recovered_payloads/<stage-name>_ai_workspace
+```
+
+`dump_ai_workspace.py` automatically uses the IDA path found by `find_ida.py`. If discovery fails, set `IDA_PATH` to `idat64.exe`/`idat.exe` or pass `--ida <path>` explicitly.
+
+The dumper carries this runbook into the child workspace, uses IDA for native PE stages, and uses ILSpyCmd for managed stages when available. Enter the child workspace and repeat Phase 1 recovery against that stage. Continue this process for every evidence-supported stage until no additional recoverable payload remains. Do not execute a recovered artifact at any point. Record every parent-to-child workspace relationship and recovered file hash in `./investigation.md`.
+
+For a managed .NET stage, verify the available decompiler before exporting:
+
+```bash
+python find_ilspycmd.py
+python dump_ai_workspace.py ./recovered_payloads/<recovered-file>.dll --output ./recovered_payloads/<stage-name>_ai_workspace
+```
+
+The dumper automatically uses the discovered ILSpyCmd command. If it is unavailable, install .NET 8 and run `dotnet tool install --global ilspycmd`.
+
 Do not infer the functionality of unavailable or unrecovered payloads.
+
+##### Native Workspace Export Reliability and Diagnostics
+
+Treat successful native workspace export as a capability and completeness check, not merely as a zero process exit or the presence of `AGENTS.md`.
+
+- The native export backend must be usable without importing Qt-dependent GUI modules. Keep the Genesect package initializer lightweight and keep collection/writing code dependent only on IDA APIs and ordinary Python modules. Use standard Python logging in the export backend, with any Qt logger provided only as an optional GUI adapter.
+- A console IDA executable such as `idat.exe` may lack the PySide6 environment required by GUI-dependent Genesect imports. Disabling a progress dialog does not make those imports headless-safe. If a console export fails because of Qt/PySide initialization and a GUI-capable `ida.exe` is available, retry with `ida.exe -A` and record the fallback. Treat this as a compatibility workaround, not proof that the backend is truly headless.
+- Before collecting functions, the IDAPython bootstrap must call `ida_auto.auto_wait()` and fail clearly if autoanalysis does not complete. Never accept a fresh, partially analyzed database as a complete export.
+- Select IDA by tested capability, not filename alone. A preflight should establish that IDAPython starts, the export backend imports, decompiler availability is known, and a status file can be written. Record whether the selected executable is GUI or console mode.
+- Preserve durable diagnostics for every native export attempt: IDA's own log written through an absolute `-L` path, a bootstrap log with startup milestones and full tracebacks, and a machine-readable status file containing success/failure, input SHA-256, selected executable and mode, decompiler availability, and output location. Retain these files after failure or timeout and record the actual command arguments and persistent bootstrap path.
+- Do not treat `Could not find platform dependent libraries <exec_prefix>` as the root cause by itself. Inspect the bootstrap traceback and IDA log for the actionable failure. A missing relative bootstrap path during a manual diagnostic invocation is likewise distinct from the normal dumper, which supplies an absolute path.
+- Validate completion using the input hash, manifest, required catalogs, and declared-versus-written function file counts. Write a completion marker only after every required export step succeeds. Preserve diagnostics and partial outputs on startup errors, exceptions, and timeouts, but never present them as a complete child workspace.
+- Avoid hiding all progress until IDA exits. Surface useful progress while still capturing the complete logs needed for diagnosis.
+
+When these implementation safeguards are unavailable in an already exported workspace, apply the same principles operationally: preserve the failure evidence, try only evidence-based safe fallbacks, disclose whether decompilation was unavailable or incomplete, and do not infer behaviour from missing output.
+
+##### Report Rendering Reliability
+
+The report generator must preserve the report's technical content and render it faithfully.
+
+- Verify that Mermaid diagrams render as diagrams rather than source-like arrow text. If the bundled renderer supports only a limited Mermaid subset, keep generated diagrams within that subset or use a full renderer and disclose any unsupported construct.
+- Use a layout appropriate to wide navigation and protocol tables, including a landscape page where necessary, and verify that addresses, names, and columns remain readable.
+- Do not silently label a sample `Unclassified` merely because optional renderer metadata is absent; derive the visible classification from report evidence when possible or omit the label.
+- Do not silently truncate code blocks or other report content. If a rendering limit is unavoidable, make the omission explicit in the rendered report and logs.
+- Rendering failures must return a nonzero exit status. Inspect the produced PDF for clipped tables, malformed diagrams, excessive wrapping, and missing content before claiming successful visual verification.
 
 ### 3. Cross-Function and Data-Flow Analysis
 
@@ -72,6 +153,18 @@ Do not analyze important functions in isolation.
 - Identify where important data originates and where it is ultimately consumed.
 
 When a function's purpose is unclear, investigate its surrounding context before assigning a behavioural interpretation.
+
+Before detailed analysis, establish an evidence-based map of the sample:
+
+- Identify true entry points and startup wrappers.
+- Inspect TLS callbacks, exports, exception handlers, module initializers, and callback registrations.
+- Trace xrefs to network, cryptography, process, memory, file, registry, service, persistence, and anti-analysis APIs.
+- Review vtables/vftables, indirect calls, function pointers, jump tables, and dynamically resolved APIs.
+- Prioritize the largest, most-connected, and behaviorally significant non-library functions.
+- For every recovered payload stage, repeat this triage from that stage’s own entry points.
+- Record the selected entry points, high-priority functions, and unresolved navigation gaps in `investigation.md`.
+
+Treat automated triage as prioritization evidence, not proof of behavior.
 
 ### 4. Evidence Verification and Analytical Reasoning
 
@@ -302,7 +395,6 @@ Instead, synthesize related findings into a coherent research narrative.
 - Explain complex behaviour without turning the report into a function-by-function walkthrough.
 - Prioritize operational behaviour and technical significance over the number of identified functions.
 - Keep supporting code snippets concise and relevant.
-- Do not include investigation checklists, IDB navigation instructions, or unresolved research tasks in the published report.
 
 The final report must stand independently as a professional malware research article, even for readers who have not seen the investigation notes.
 
@@ -365,6 +457,10 @@ Determine the structure based on the malware's actual execution flow, capabiliti
 
 The final report should read as a cohesive technical research article rather than a checklist of malware capabilities.
 
+#### Technical Tables
+
+Use concise Markdown tables when they materially improve the clarity of structured, evidence-supported information. Relevant examples include backdoor or remote-command handlers (command, arguments, behavior, execution conditions), packet or protocol structures (field, offset/order, size, encoding, meaning), configuration entries, payload stages, persistence artifacts, and high-value indicators. Explain each table briefly and cite the supporting code or artifact. Do not create tables from speculation, incomplete guesses, or low-value string lists.
+
 ---
 
 ### 6. Decompiled Code Snippets
@@ -409,7 +505,7 @@ Cover relevant:
 - Command dispatch and callback mechanisms.
 - Error handling and fallback behaviour.
 
-Include a compact Mermaid flowchart or sequence diagram only when it helps explain complex behaviour.
+Include a **Malware Overview Diagram** in every report: a compact Mermaid diagram showing the verified high-level components, execution stages, external interactions, and recovered payload relationships. Use a top-to-bottom Mermaid flowchart (`flowchart TB`) whenever it clarifies execution, unpacking, injection, or stage transitions. Add a Mermaid sequence diagram when interactions between the sample, processes, services, C2 endpoints, or payload stages are significant and evidence-supported. Do not force a sequence diagram for simple samples.
 
 Diagrams must accurately represent supported relationships and avoid inventing missing execution stages.
 
@@ -445,8 +541,6 @@ In addition to the report, generate function-renaming artifacts to improve IDB r
 
 Use the verified investigation findings and original code artifacts to identify meaningful function names.
 
-**Do not include an IDB navigation guide, function investigation table, or manual reverse engineering instructions in the report.**
-
 #### Function Mapping File
 
 Save:
@@ -473,6 +567,21 @@ Requirements:
 - Avoid vague or speculative names.
 - Ensure suggested names are unique and valid IDA identifiers.
 - Do not invent function mappings when the available evidence is insufficient.
+
+In addition to high-confidence malware-specific functions, prioritize naming complete reachable function trees rooted at meaningful entry points:
+
+- `main`, `wmain`, `WinMain`, `wWinMain`
+- `DllMain`, `DllEntryPoint`, CRT startup wrappers, and module initializers
+- TLS callbacks
+- exported functions
+- service, COM, plugin, callback, or framework entry handlers when evidence identifies them
+- virtual methods referenced by recovered vtables/vftables
+
+For each identified root, recursively trace direct callers/callees and relevant indirect or vtable-dispatch targets. Propose descriptive names for evidence-supported functions in that tree, including vtable methods.
+
+Apply a strict scope limit: perform exhaustive recursive naming only when the reachable non-library function tree contains **100 or fewer functions**. If it exceeds 100 functions, rename the root and only high-confidence malware-specific or behaviorally significant descendants.
+
+Exclude imports, compiler/CRT helpers, ordinary library code, and functions whose purpose is unsupported. Preserve meaningful existing names. Record each root, reachable-function count, and scope-limit decision in `investigation.md`.
 
 Use pipe-delimited mappings:
 
@@ -762,4 +871,3 @@ Before finalizing, review the report for technical accuracy, completeness, and r
 Correct identified problems before finalizing.
 
 **Final instruction: Do not optimize for report length, number of findings, or number of renamed functions. Optimize for technical accuracy, analytical completeness, professional research writing, and meaningful IDB enrichment.**
-

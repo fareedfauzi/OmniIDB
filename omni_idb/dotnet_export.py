@@ -406,6 +406,7 @@ def export_dotnet_workspace(
         "This workspace includes the complete two-phase analysis runbook and standalone compiler:",
         "- `run_analysis.md` - Two-phase automated runbook (Pass 1 deep investigation -> `investigation.md`, Pass 2 technical research report -> `report.md`, decompiler navigation, and deliverables).",
         "- `render_report.py` - Standalone CLI tool to compile `report.md` into styled `report.html` and vector `report.pdf`.",
+        "- `dump_ai_workspace.py` - Standalone static exporter for recovered payload stages; it creates child AI workspaces without executing the recovered file.",
         "",
         "To execute:",
         "```bash",
